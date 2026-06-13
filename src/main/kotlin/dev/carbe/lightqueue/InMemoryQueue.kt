@@ -10,8 +10,6 @@ import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import org.slf4j.LoggerFactory
 import java.util.concurrent.atomic.AtomicLong
-import kotlin.time.Duration
-import kotlin.time.times
 
 class InMemoryQueue<T> internal constructor(
     scope: CoroutineScope,
@@ -200,33 +198,5 @@ class InMemoryQueue<T> internal constructor(
         channel.close()
         workers.joinAll()
         logger.debug("{}Queue stopped", logPrefix)
-    }
-}
-
-enum class OverflowStrategy {
-    EVICT_OLDEST,
-    REJECT,
-    BACKPRESSURE,
-}
-
-sealed interface EnqueueResult {
-    data object Enqueued : EnqueueResult
-    data object Rejected : EnqueueResult
-    data object Closed : EnqueueResult
-}
-
-/**
- * [maxAttempts] is the total number of times the handler is executed for an
- * event (initial attempt included), not the number of retries.
- */
-data class RetryPolicy(val maxAttempts: Int, val backoffType: BackoffType) {
-    init {
-        require(maxAttempts >= 1) { "maxAttempts must be >= 1, but was $maxAttempts" }
-    }
-
-    fun delayForAttempt(attemptNumber: Int): Duration = when (backoffType) {
-        is BackoffType.ExponentialBackoff -> backoffType.initialDelay * (1 shl (attemptNumber - 1))
-        is BackoffType.LinearBackoff -> attemptNumber * backoffType.initialDelay
-        is BackoffType.NoBackoff -> Duration.ZERO
     }
 }

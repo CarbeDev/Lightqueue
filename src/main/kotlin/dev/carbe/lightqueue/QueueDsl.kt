@@ -1,7 +1,6 @@
 package dev.carbe.lightqueue
 
 import kotlinx.coroutines.CoroutineScope
-import kotlin.time.Duration
 
 class QueueDsl<T> internal constructor(private val scope: CoroutineScope) {
     var capacity: Int = 100
@@ -75,24 +74,4 @@ class RetryPolicyDsl {
         requireNotNull(backoff) { "backoff cannot be null" }
         return RetryPolicy(maxAttempts!!, backoff!!)
     }
-}
-
-object Backoff {
-    fun exponential(initialDelay: Duration): BackoffType.ExponentialBackoff {
-        require(initialDelay > Duration.ZERO) { "initialDelay must be > 0, but was $initialDelay" }
-        return BackoffType.ExponentialBackoff(initialDelay)
-    }
-
-    fun linear(initialDelay: Duration): BackoffType.LinearBackoff {
-        require(initialDelay > Duration.ZERO) { "initialDelay must be > 0, but was $initialDelay" }
-        return BackoffType.LinearBackoff(initialDelay)
-    }
-
-    fun noBackoff(): BackoffType.NoBackoff = BackoffType.NoBackoff
-}
-
-sealed class BackoffType {
-    class ExponentialBackoff internal constructor(val initialDelay: Duration) : BackoffType()
-    class LinearBackoff internal constructor(val initialDelay: Duration) : BackoffType()
-    data object NoBackoff : BackoffType()
 }
