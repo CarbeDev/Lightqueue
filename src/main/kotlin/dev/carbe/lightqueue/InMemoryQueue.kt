@@ -9,6 +9,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import org.slf4j.LoggerFactory
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.time.Duration
 import kotlin.time.times
 
@@ -21,6 +22,7 @@ class InMemoryQueue<T> internal constructor(
     private val overflowStrategy: OverflowStrategy,
     private val onDropped: ((T) -> Unit)?,
     capacity: Int,
+    private val name: String? = null,
 ) {
     companion object {
         private val logger = LoggerFactory.getLogger(InMemoryQueue::class.java)
@@ -28,6 +30,39 @@ class InMemoryQueue<T> internal constructor(
         fun <T> create(scope: CoroutineScope, block: QueueDsl<T>.() -> Unit): InMemoryQueue<T> =
             QueueDsl<T>(scope).apply(block).toInMemoryQueue()
     }
+
+    // Prepended to every log statement so a process running several queues can tell them
+    // apart. A plain prefix is used rather than MDC because coroutines hop threads freely.
+    private val logPrefix = name?.let { "[$it] " } ?: ""
+
+    // Gauges: go up and down as events flow through. The other counters are monotonic.
+    private val depth = AtomicLong()
+    private val inFlight = AtomicLong()
+    private val enqueued = AtomicLong()
+    private val processed = AtomicLong()
+    private val deadLettered = AtomicLong()
+    private val dropped = AtomicLong()
+    private val rejected = AtomicLong()
+    private val retries = AtomicLong()
+
+    /**
+     * Immutable snapshot of the queue's counters. Cheap to call; intended to be polled and
+     * wired into an external metrics system (e.g. Micrometer gauges) by the caller.
+     *
+     * The fields are read independently, so a snapshot taken while events are in motion is
+     * eventually-consistent rather than a single atomic instant; the invariant
+     * `enqueued = processed + deadLettered + dropped + inFlight + depth` holds at quiescence.
+     */
+    fun metrics(): QueueMetrics = QueueMetrics(
+        depth = depth.get(),
+        inFlight = inFlight.get(),
+        enqueued = enqueued.get(),
+        processed = processed.get(),
+        deadLettered = deadLettered.get(),
+        dropped = dropped.get(),
+        rejected = rejected.get(),
+        retries = retries.get(),
+    )
 
     private val channel =
         Channel<T>(
@@ -39,20 +74,33 @@ class InMemoryQueue<T> internal constructor(
                 OverflowStrategy.REJECT, OverflowStrategy.BACKPRESSURE -> BufferOverflow.SUSPEND
             },
             onUndeliveredElement = { event ->
-                logger.debug("Event dropped before processing: {}", event)
+                logger.debug("{}Event dropped before processing: {}", logPrefix, event)
+                // An EVICT_OLDEST eviction (or scope-cancellation abandonment) reaches the event
+                // here after it was already counted into depth. We must decrement depth as well as
+                // bumping dropped, otherwise the gauge drifts permanently upward.
+                dropped.incrementAndGet()
+                depth.decrementAndGet()
                 onDropped?.invoke(event)
             },
         )
 
     private val workers = List(numberOfWorkers) { workerIndex ->
         scope.launch {
-            logger.debug("Worker {} started (capacity={}, overflow={})", workerIndex, capacity, overflowStrategy)
+            logger.debug("{}Worker {} started (capacity={}, overflow={})", logPrefix, workerIndex, capacity, overflowStrategy)
 
             for (event in channel) {
-                processWithRetry(event)
+                // Bump inFlight before decrementing depth so the invariant never transiently
+                // under-counts (the event is always accounted for in exactly one of the two).
+                inFlight.incrementAndGet()
+                depth.decrementAndGet()
+                try {
+                    processWithRetry(event)
+                } finally {
+                    inFlight.decrementAndGet()
+                }
             }
 
-            logger.debug("Worker {} stopped", workerIndex)
+            logger.debug("{}Worker {} stopped", logPrefix, workerIndex)
         }
     }
 
@@ -61,13 +109,16 @@ class InMemoryQueue<T> internal constructor(
         lateinit var lastError: Throwable
 
         for (attempt in 1..maxAttempts) {
+            // Every attempt past the first is a retry.
+            if (attempt > 1) retries.incrementAndGet()
             try {
                 onProcess(event)
+                processed.incrementAndGet()
                 return
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                logger.warn("Attempt {}/{} failed for event: {}", attempt, maxAttempts, event, e)
+                logger.warn("{}Attempt {}/{} failed for event: {}", logPrefix, attempt, maxAttempts, event, e)
                 lastError = e
             }
 
@@ -76,7 +127,10 @@ class InMemoryQueue<T> internal constructor(
             }
         }
 
-        logger.error("All {} attempt(s) exhausted, dead-lettering event: {}", maxAttempts, event, lastError)
+        logger.error("{}All {} attempt(s) exhausted, dead-lettering event: {}", logPrefix, maxAttempts, event, lastError)
+        // The event reaches a terminal state here regardless of whether onDeadLetter is null
+        // or throws, so the counter is bumped before invoking the callback.
+        deadLettered.incrementAndGet()
         try {
             onDeadLetter?.invoke(event, lastError)
         } catch (e: CancellationException) {
@@ -84,7 +138,7 @@ class InMemoryQueue<T> internal constructor(
         } catch (e: Exception) {
             // A failing dead-letter callback must not take down the worker loop:
             // the event would simply be lost with no trace otherwise.
-            logger.error("onDeadLetter callback failed for event: {}", event, e)
+            logger.error("{}onDeadLetter callback failed for event: {}", logPrefix, event, e)
         }
     }
 
@@ -103,10 +157,19 @@ class InMemoryQueue<T> internal constructor(
     fun tryEnqueue(event: T): EnqueueResult {
         val result = channel.trySend(event)
         return when {
-            result.isSuccess -> EnqueueResult.Enqueued
+            result.isSuccess -> {
+                // Accepted: count it into the queue. An EVICT_OLDEST eviction triggered by this
+                // send is handled separately in onUndeliveredElement (dropped++ / depth--).
+                enqueued.incrementAndGet()
+                depth.incrementAndGet()
+                EnqueueResult.Enqueued
+            }
+            // A closed channel touches no counter: the event never entered the queue.
             result.isClosed -> EnqueueResult.Closed
             else -> {
-                logger.debug("Buffer full, rejecting event: {}", event)
+                logger.debug("{}Buffer full, rejecting event: {}", logPrefix, event)
+                // Rejected events never entered the queue, so depth is left untouched.
+                rejected.incrementAndGet()
                 EnqueueResult.Rejected
             }
         }
@@ -124,6 +187,8 @@ class InMemoryQueue<T> internal constructor(
 
         return try {
             channel.send(event)
+            enqueued.incrementAndGet()
+            depth.incrementAndGet()
             EnqueueResult.Enqueued
         } catch (e: ClosedSendChannelException) {
             EnqueueResult.Closed
@@ -131,10 +196,10 @@ class InMemoryQueue<T> internal constructor(
     }
 
     suspend fun stop() {
-        logger.debug("Stopping queue: draining buffer")
+        logger.debug("{}Stopping queue: draining buffer", logPrefix)
         channel.close()
         workers.joinAll()
-        logger.debug("Queue stopped")
+        logger.debug("{}Queue stopped", logPrefix)
     }
 }
 

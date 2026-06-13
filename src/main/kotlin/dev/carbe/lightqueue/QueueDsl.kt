@@ -6,6 +6,13 @@ import kotlin.time.Duration
 class QueueDsl<T> internal constructor(private val scope: CoroutineScope) {
     var capacity: Int = 100
     var workers: Int = 1
+
+    /**
+     * Optional queue name, prefixed onto the SLF4J log statements (e.g. `[webhooks] Worker 0
+     * started`). Useful as soon as a process runs more than one queue, and as a natural tag
+     * when exporting metrics.
+     */
+    var name: String? = null
     var onDeadLetter: (suspend (T, Throwable) -> Unit)? = null
     var overflowStrategy: OverflowStrategy? = null
 
@@ -54,6 +61,7 @@ class QueueDsl<T> internal constructor(private val scope: CoroutineScope) {
             overflowStrategy ?: OverflowStrategy.BACKPRESSURE,
             onDropped,
             capacity,
+            name,
         )
     }
 }

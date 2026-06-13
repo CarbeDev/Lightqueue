@@ -1,5 +1,8 @@
 package dev.carbe.lightqueue
 
+import ch.qos.logback.classic.Logger
+import ch.qos.logback.classic.spi.ILoggingEvent
+import ch.qos.logback.core.read.ListAppender
 import io.kotest.assertions.throwables.shouldThrow
 import io.kotest.core.spec.style.FunSpec
 import io.kotest.matchers.collections.shouldContainExactly
@@ -10,6 +13,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.currentTime
 import kotlinx.coroutines.test.runTest
+import org.slf4j.LoggerFactory
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 
@@ -518,6 +522,250 @@ class InMemoryQueueTest : FunSpec({
                     }
                 }
             }
+        }
+    }
+
+    test("metrics reflect enqueued and processed counts after a normal run") {
+        runTest {
+            val queue = InMemoryQueue.create<Int>(backgroundScope) {
+                process {}
+            }
+
+            repeat(5) { queue.enqueue(it) }
+            queue.stop()
+
+            val metrics = queue.metrics()
+            metrics.enqueued shouldBe 5
+            metrics.processed shouldBe 5
+            metrics.depth shouldBe 0
+            metrics.inFlight shouldBe 0
+            metrics.deadLettered shouldBe 0
+            metrics.dropped shouldBe 0
+            metrics.rejected shouldBe 0
+            metrics.retries shouldBe 0
+        }
+    }
+
+    test("depth reflects events sitting in the buffer with no worker draining them") {
+        runTest {
+            val queue = InMemoryQueue.create<Int>(backgroundScope) {
+                process {}
+                capacity = 10
+                workers = 0
+                allowNoWorkers = true
+            }
+
+            repeat(3) { queue.enqueue(it) }
+
+            queue.metrics().depth shouldBe 3
+            queue.metrics().enqueued shouldBe 3
+            queue.metrics().inFlight shouldBe 0
+        }
+    }
+
+    test("inFlight is positive while a handler is suspended and back to zero afterwards") {
+        runTest {
+            val queue = InMemoryQueue.create<Int>(backgroundScope) {
+                process { delay(100) }
+            }
+
+            queue.enqueue(1)
+
+            // Let the worker pull the event and suspend inside the 100ms handler delay.
+            testScheduler.advanceTimeBy(50)
+            queue.metrics().inFlight shouldBe 1
+            queue.metrics().depth shouldBe 0
+
+            queue.stop()
+
+            queue.metrics().inFlight shouldBe 0
+            queue.metrics().processed shouldBe 1
+        }
+    }
+
+    test("deadLettered counter increments once retries are exhausted") {
+        runTest {
+            val queue = InMemoryQueue.create<Int>(backgroundScope) {
+                process { _ -> throw IllegalStateException("always fails") }
+                retryPolicy {
+                    maxAttempts = 3
+                    backoff = Backoff.noBackoff()
+                }
+            }
+
+            queue.enqueue(42)
+            queue.stop()
+
+            queue.metrics().deadLettered shouldBe 1
+            queue.metrics().processed shouldBe 0
+        }
+    }
+
+    test("dropped increments and depth decrements under EVICT_OLDEST, preserving the invariant") {
+        runTest {
+            val queue = InMemoryQueue.create<Int>(backgroundScope) {
+                process {}
+                capacity = 2
+                workers = 0
+                allowNoWorkers = true
+                overflowStrategy = OverflowStrategy.EVICT_OLDEST
+            }
+
+            queue.enqueue(1)
+            queue.enqueue(2)
+            queue.enqueue(3) // evicts 1
+
+            val metrics = queue.metrics()
+            metrics.enqueued shouldBe 3
+            metrics.dropped shouldBe 1
+            metrics.depth shouldBe 2 // 2 and 3 still buffered
+            metrics.rejected shouldBe 0
+
+            // The eviction trap: depth must have been decremented, so the invariant holds.
+            metrics.enqueued shouldBe
+                metrics.processed + metrics.deadLettered + metrics.dropped + metrics.inFlight + metrics.depth
+        }
+    }
+
+    test("rejected increments without touching depth or dropped, for REJECT and full BACKPRESSURE buffers") {
+        runTest {
+            val rejectQueue = InMemoryQueue.create<Int>(backgroundScope) {
+                process {}
+                capacity = 2
+                workers = 0
+                allowNoWorkers = true
+                overflowStrategy = OverflowStrategy.REJECT
+            }
+
+            rejectQueue.enqueue(1)
+            rejectQueue.enqueue(2)
+            rejectQueue.enqueue(3) shouldBe EnqueueResult.Rejected
+
+            rejectQueue.metrics().rejected shouldBe 1
+            rejectQueue.metrics().depth shouldBe 2 // unchanged by the rejection
+            rejectQueue.metrics().dropped shouldBe 0
+            rejectQueue.metrics().enqueued shouldBe 2
+
+            val backpressureQueue = InMemoryQueue.create<Int>(backgroundScope) {
+                process {}
+                capacity = 2
+                workers = 0
+                allowNoWorkers = true
+                overflowStrategy = OverflowStrategy.BACKPRESSURE
+            }
+
+            backpressureQueue.tryEnqueue(1)
+            backpressureQueue.tryEnqueue(2)
+            backpressureQueue.tryEnqueue(3) shouldBe EnqueueResult.Rejected
+
+            backpressureQueue.metrics().rejected shouldBe 1
+            backpressureQueue.metrics().depth shouldBe 2
+            backpressureQueue.metrics().dropped shouldBe 0
+        }
+    }
+
+    test("retries counter equals attempts beyond the first for a failing-then-succeeding event") {
+        runTest {
+            var attempt = 0
+            val queue = InMemoryQueue.create<Int>(backgroundScope) {
+                process { _ ->
+                    attempt++
+                    if (attempt < 3) throw IllegalStateException("not yet")
+                }
+                retryPolicy {
+                    maxAttempts = 5
+                    backoff = Backoff.noBackoff()
+                }
+            }
+
+            queue.enqueue(1)
+            queue.stop()
+
+            // 3 executions total => 2 retries beyond the first.
+            queue.metrics().retries shouldBe 2
+            queue.metrics().processed shouldBe 1
+            queue.metrics().deadLettered shouldBe 0
+        }
+    }
+
+    test("the global invariant holds across a mixed scenario") {
+        runTest {
+            val queue = InMemoryQueue.create<Int>(backgroundScope) {
+                process { event ->
+                    if (event % 7 == 0) throw IllegalStateException("multiples of 7 fail")
+                }
+                retryPolicy {
+                    maxAttempts = 2
+                    backoff = Backoff.noBackoff()
+                }
+                onDeadLetter = { _, _ -> }
+            }
+
+            repeat(20) { queue.enqueue(it) }
+            queue.stop()
+
+            val metrics = queue.metrics()
+            metrics.enqueued shouldBe 20
+            metrics.inFlight shouldBe 0
+            metrics.depth shouldBe 0
+            metrics.deadLettered shouldBe 3 // 0, 7, 14
+            metrics.processed shouldBe 17
+            metrics.retries shouldBe 3 // one retry per dead-lettered event
+
+            metrics.enqueued shouldBe
+                metrics.processed + metrics.deadLettered + metrics.dropped + metrics.inFlight + metrics.depth
+        }
+    }
+
+    test("metrics counters stay non-negative gauges and the invariant holds mid-flight") {
+        runTest {
+            val queue = InMemoryQueue.create<Int>(backgroundScope) {
+                process { delay(100) } // each event occupies the single worker for 100ms
+                workers = 1
+                capacity = 10
+            }
+
+            repeat(4) { queue.enqueue(it) }
+
+            // 50ms in: the worker is suspended inside the first event's handler, the rest wait.
+            testScheduler.advanceTimeBy(50)
+            val midFlight = queue.metrics()
+            midFlight.inFlight shouldBe 1
+            midFlight.depth shouldBe 3
+            midFlight.enqueued shouldBe 4
+            midFlight.enqueued shouldBe
+                midFlight.processed + midFlight.deadLettered + midFlight.dropped +
+                midFlight.inFlight + midFlight.depth
+
+            queue.stop()
+
+            queue.metrics().processed shouldBe 4
+            queue.metrics().inFlight shouldBe 0
+            queue.metrics().depth shouldBe 0
+        }
+    }
+
+    test("queue name appears as a prefix in the SLF4J output") {
+        // Capture everything the InMemoryQueue logger emits via a logback ListAppender.
+        val slf4jLogger = LoggerFactory.getLogger(InMemoryQueue::class.java) as Logger
+        val appender = ListAppender<ILoggingEvent>().apply { start() }
+        slf4jLogger.addAppender(appender)
+
+        try {
+            runTest {
+                val queue = InMemoryQueue.create<Int>(backgroundScope) {
+                    process {}
+                    name = "webhooks"
+                }
+                queue.enqueue(1)
+                queue.stop()
+            }
+
+            val messages = appender.list.map { it.formattedMessage }
+            messages.any { it.startsWith("[webhooks] ") } shouldBe true
+        } finally {
+            slf4jLogger.detachAppender(appender)
+            appender.stop()
         }
     }
 })
