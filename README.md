@@ -8,7 +8,7 @@ overflow strategies — configured through a small DSL.
 
 ```kotlin
 dependencies {
-    implementation("dev.carbe:lightqueue:0.2.0")
+    implementation("dev.carbe:lightqueue:0.3.0")
 }
 ```
 
@@ -48,6 +48,55 @@ Overflow strategies:
 - `BACKPRESSURE` (default) — `enqueue` suspends until there is room.
 - `REJECT` — `enqueue`/`tryEnqueue` return `EnqueueResult.Rejected` when full.
 - `EVICT_OLDEST` — the oldest buffered event is evicted (reported via `onDropped`) to make room.
+
+## Priorities
+
+`PriorityInMemoryQueue` is a sibling of `InMemoryQueue` that schedules events by
+[`Priority`](src/main/kotlin/dev/carbe/lightqueue/Priority.kt):
+
+```kotlin
+enum class Priority { HIGH, NORMAL, LOW }
+```
+
+```kotlin
+import dev.carbe.lightqueue.PriorityInMemoryQueue
+import dev.carbe.lightqueue.Priority
+
+val queue = PriorityInMemoryQueue.create<Event>(scope) {
+    capacity = 100 // applied to EACH priority level independently
+    workers = 3
+
+    process { event ->
+        handle(event)
+    }
+}
+
+queue.enqueue(event)                    // priority defaults to Priority.NORMAL
+queue.enqueue(event, Priority.HIGH)
+queue.tryEnqueue(event, Priority.LOW)
+
+queue.stop()
+```
+
+Every level (`HIGH`, `NORMAL`, `LOW`) has its own buffer, with its own capacity,
+overflow handling and metrics — filling or evicting from one level never affects
+another.
+
+**Scheduling is strict under load, best-effort when idle.** Workers always check
+`HIGH`, then `NORMAL`, then `LOW`, taking the first non-empty buffer. Whenever any
+level has a backlog, the highest-priority non-empty level is always served next —
+a steady stream of `HIGH` events can starve `LOW` indefinitely. The only relaxation
+is when the queue is completely idle (every level empty) and events for multiple
+levels arrive at essentially the same instant while a worker is parked waiting:
+in that narrow race the worker may pick up whichever event it was woken for, even
+if it isn't the highest-priority one — the very next pick immediately re-applies
+the strict order.
+
+**Metrics**: `metrics(priority)` returns a per-level `QueueMetrics` snapshot (its
+`name` is the configured `name` suffixed with the level, e.g. `"webhooks:HIGH"`).
+`metrics()` returns the aggregate across all levels, with the plain configured
+`name`; the usual invariant `enqueued = processed + deadLettered + dropped +
+inFlight + depth` holds for both the aggregate and each level.
 
 ## When to use / when not to
 

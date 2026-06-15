@@ -1,11 +1,9 @@
 package dev.carbe.lightqueue
 
-import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.channels.ClosedSendChannelException
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import org.slf4j.LoggerFactory
@@ -65,6 +63,18 @@ class InMemoryQueue<T> internal constructor(
         retries = retries.get(),
     )
 
+    // Delegates the retry/dead-letter loop to the shared implementation, wired to this
+    // queue's own counters and logger prefix. See Processing.kt.
+    private val processor = EventProcessor(
+        onProcess = onProcess,
+        retryPolicy = retryPolicy,
+        onDeadLetter = onDeadLetter,
+        logPrefix = logPrefix,
+        onProcessed = { processed.incrementAndGet() },
+        onDeadLettered = { deadLettered.incrementAndGet() },
+        onRetry = { retries.incrementAndGet() },
+    )
+
     private val channel =
         Channel<T>(
             capacity = capacity,
@@ -95,51 +105,13 @@ class InMemoryQueue<T> internal constructor(
                 inFlight.incrementAndGet()
                 depth.decrementAndGet()
                 try {
-                    processWithRetry(event)
+                    processor.process(event)
                 } finally {
                     inFlight.decrementAndGet()
                 }
             }
 
             logger.debug("{}Worker {} stopped", logPrefix, workerIndex)
-        }
-    }
-
-    private suspend fun processWithRetry(event: T) {
-        val maxAttempts = retryPolicy?.maxAttempts ?: 1
-        lateinit var lastError: Throwable
-
-        for (attempt in 1..maxAttempts) {
-            // Every attempt past the first is a retry.
-            if (attempt > 1) retries.incrementAndGet()
-            try {
-                onProcess(event)
-                processed.incrementAndGet()
-                return
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                logger.warn("{}Attempt {}/{} failed for event: {}", logPrefix, attempt, maxAttempts, event, e)
-                lastError = e
-            }
-
-            if (attempt < maxAttempts) {
-                retryPolicy?.let { delay(it.delayForAttempt(attempt)) }
-            }
-        }
-
-        logger.error("{}All {} attempt(s) exhausted, dead-lettering event: {}", logPrefix, maxAttempts, event, lastError)
-        // The event reaches a terminal state here regardless of whether onDeadLetter is null
-        // or throws, so the counter is bumped before invoking the callback.
-        deadLettered.incrementAndGet()
-        try {
-            onDeadLetter?.invoke(event, lastError)
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            // A failing dead-letter callback must not take down the worker loop:
-            // the event would simply be lost with no trace otherwise.
-            logger.error("{}onDeadLetter callback failed for event: {}", logPrefix, event, e)
         }
     }
 
