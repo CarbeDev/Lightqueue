@@ -92,6 +92,14 @@ in that narrow race the worker may pick up whichever event it was woken for, eve
 if it isn't the highest-priority one — the very next pick immediately re-applies
 the strict order.
 
+This strict ordering is deliberate, and there is **no built-in aging or
+anti-starvation**: a `LOW` event will wait behind every `HIGH`/`NORMAL` event for
+as long as those keep arriving, however old it gets. That is the right default for
+a priority queue, but it means starvation is the caller's concern, not the queue's.
+If `LOW` work must eventually run, keep the higher levels from being a truly
+unbounded firehose — for example bound their inflow, run a separate queue for the
+low-priority stream, or periodically promote aged work to a higher level yourself.
+
 **Metrics**: `metrics(priority)` returns a per-level `QueueMetrics` snapshot (its
 `name` is the configured `name` suffixed with the level, e.g. `"webhooks:HIGH"`).
 `metrics()` returns the aggregate across all levels, with the plain configured

@@ -2,14 +2,10 @@ package dev.carbe.lightqueue
 
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.DelicateCoroutinesApi
-import kotlinx.coroutines.channels.BufferOverflow
-import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.channels.ClosedSendChannelException
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.selects.select
 import org.slf4j.LoggerFactory
-import java.util.concurrent.atomic.AtomicLong
 
 /**
  * A sibling of [InMemoryQueue] with [Priority]-aware scheduling: each [Priority] level gets
@@ -44,73 +40,29 @@ class PriorityInMemoryQueue<T> internal constructor(
     private val logPrefix = name?.let { "[$it] " } ?: ""
 
     /**
-     * Per-level gauges and counters. Mirrors the flat set of [AtomicLong]s in [InMemoryQueue],
-     * but one full set per [Priority] so each level's [QueueMetrics] snapshot is independent.
+     * One [QueueLane] per [Priority] level — each lane owns that level's own channel, counters
+     * and [EventProcessor] (see QueueLane.kt), configured exactly like [InMemoryQueue]'s single
+     * lane. Keeping a full lane per level means eviction, rejection and processing on one level
+     * never touch another's gauges.
+     *
+     * `logTag` reproduces the level-tagged log lines this queue used to emit directly, e.g.
+     * `"...Event dropped before processing (HIGH): ..."`.
      */
-    private class Counters {
-        val depth = AtomicLong()
-        val inFlight = AtomicLong()
-        val enqueued = AtomicLong()
-        val processed = AtomicLong()
-        val deadLettered = AtomicLong()
-        val dropped = AtomicLong()
-        val rejected = AtomicLong()
-        val wouldBlock = AtomicLong()
-        val retries = AtomicLong()
-    }
-
-    private val counters: Map<Priority, Counters> =
-        Priority.entries.associateWith { Counters() }
-
-    /**
-     * One [Channel] per [Priority] level, each configured exactly like [InMemoryQueue]'s
-     * single channel — same `onBufferOverflow` mapping from [overflowStrategy], same
-     * `onUndeliveredElement` bookkeeping — but reading and writing that level's own
-     * [Counters] so eviction/abandonment on one level never touches another's gauges.
-     */
-    private val channels: Map<Priority, Channel<T>> =
+    private val lanes: Map<Priority, QueueLane<T>> =
         Priority.entries.associateWith { priority ->
-            val levelCounters = counters.getValue(priority)
-            Channel(
+            QueueLane(
                 capacity = capacity,
-                onBufferOverflow = when (overflowStrategy) {
-                    OverflowStrategy.EVICT_OLDEST -> BufferOverflow.DROP_OLDEST
-                    // REJECT relies on trySend failing on a full SUSPEND channel,
-                    // so the caller can be told the event was rejected.
-                    OverflowStrategy.REJECT, OverflowStrategy.BACKPRESSURE -> BufferOverflow.SUSPEND
-                },
-                onUndeliveredElement = { event ->
-                    logger.debug("{}Event dropped before processing ({}): {}", logPrefix, priority, event)
-                    // An EVICT_OLDEST eviction (or scope-cancellation abandonment) reaches the event
-                    // here after it was already counted into depth. We must decrement depth as well as
-                    // bumping dropped, otherwise the gauge drifts permanently upward.
-                    levelCounters.dropped.incrementAndGet()
-                    levelCounters.depth.decrementAndGet()
-                    onDropped?.invoke(event)
-                },
-            )
-        }
-
-    /**
-     * One [EventProcessor] per [Priority] level, each wired to that level's own
-     * `processed`/`deadLettered`/`retries` counters (see Processing.kt). A worker picks the
-     * processor matching the event's level so counters never cross levels.
-     */
-    private val processors: Map<Priority, EventProcessor<T>> =
-        Priority.entries.associateWith { priority ->
-            val levelCounters = counters.getValue(priority)
-            EventProcessor(
+                overflowStrategy = overflowStrategy,
+                onDropped = onDropped,
+                logPrefix = logPrefix,
+                logTag = " ($priority)",
                 onProcess = onProcess,
                 retryPolicy = retryPolicy,
                 onDeadLetter = onDeadLetter,
-                logPrefix = logPrefix,
-                onProcessed = { levelCounters.processed.incrementAndGet() },
-                onDeadLettered = { levelCounters.deadLettered.incrementAndGet() },
-                onRetry = { levelCounters.retries.incrementAndGet() },
             )
         }
 
-    /** An event paired with the level it was read from, so a worker knows which counters/processor to use. */
+    /** An event paired with the level it was read from, so a worker knows which lane to use. */
     private data class Prioritized<T>(val event: T, val priority: Priority)
 
     /**
@@ -141,7 +93,7 @@ class PriorityInMemoryQueue<T> internal constructor(
         while (true) {
             // 1. Non-suspending strict fast path: drain the highest non-empty level first.
             for (priority in Priority.entries) {
-                val result = channels.getValue(priority).tryReceive()
+                val result = lanes.getValue(priority).channel.tryReceive()
                 if (result.isSuccess) {
                     return Prioritized(result.getOrThrow(), priority)
                 }
@@ -155,14 +107,14 @@ class PriorityInMemoryQueue<T> internal constructor(
             // whether to build a select clause for this level — a stale "open" channel that
             // closed a moment ago is handled by onReceiveCatching returning a closed result
             // (picked == null), which loops back to step 1.
-            val openChannels = Priority.entries.filter { !channels.getValue(it).isClosedForReceive }
+            val openChannels = Priority.entries.filter { !lanes.getValue(it).channel.isClosedForReceive }
             if (openChannels.isEmpty()) return null
 
             // 3. Suspend until any open level has an element. See the correctness note above:
             // the element received here is returned directly rather than discarded.
             val picked: Prioritized<T>? = select {
                 for (priority in openChannels) {
-                    channels.getValue(priority).onReceiveCatching { result ->
+                    lanes.getValue(priority).channel.onReceiveCatching { result ->
                         result.getOrNull()?.let { Prioritized(it, priority) }
                     }
                 }
@@ -179,16 +131,15 @@ class PriorityInMemoryQueue<T> internal constructor(
 
             while (true) {
                 val prioritized = nextEvent() ?: break
-                val levelCounters = counters.getValue(prioritized.priority)
+                val lane = lanes.getValue(prioritized.priority)
 
                 // Bump inFlight before decrementing depth so the invariant never transiently
                 // under-counts (the event is always accounted for in exactly one of the two).
-                levelCounters.inFlight.incrementAndGet()
-                levelCounters.depth.decrementAndGet()
+                lane.markInFlight()
                 try {
-                    processors.getValue(prioritized.priority).process(prioritized.event)
+                    lane.process(prioritized.event)
                 } finally {
-                    levelCounters.inFlight.decrementAndGet()
+                    lane.markDone()
                 }
             }
 
@@ -211,36 +162,8 @@ class PriorityInMemoryQueue<T> internal constructor(
      * A `Rejected` result never triggers `onDropped`: the event was never accepted into the
      * queue, so the caller still holds it and is responsible for it.
      */
-    fun tryEnqueue(event: T, priority: Priority = Priority.NORMAL): EnqueueResult {
-        val levelCounters = counters.getValue(priority)
-        val result = channels.getValue(priority).trySend(event)
-        return when {
-            result.isSuccess -> {
-                // Accepted: count it into the queue. An EVICT_OLDEST eviction triggered by this
-                // send is handled separately in onUndeliveredElement (dropped++ / depth--).
-                levelCounters.enqueued.incrementAndGet()
-                levelCounters.depth.incrementAndGet()
-                EnqueueResult.Enqueued
-            }
-            // A closed channel touches no counter: the event never entered the queue.
-            result.isClosed -> EnqueueResult.Closed
-            // Buffer full (only reachable for REJECT and BACKPRESSURE; EVICT_OLDEST drops the
-            // oldest and succeeds instead). Either way the event never entered the queue, so
-            // depth is left untouched — but the two cases mean different things:
-            overflowStrategy == OverflowStrategy.BACKPRESSURE -> {
-                // Not a policy rejection: a blocking enqueue() would have suspended and waited
-                // here. Counted separately so `rejected` stays a clean "refused by policy" signal.
-                logger.debug("{}Buffer full, tryEnqueue would block ({}): {}", logPrefix, priority, event)
-                levelCounters.wouldBlock.incrementAndGet()
-                EnqueueResult.Rejected
-            }
-            else -> {
-                logger.debug("{}Buffer full, rejecting event ({}): {}", logPrefix, priority, event)
-                levelCounters.rejected.incrementAndGet()
-                EnqueueResult.Rejected
-            }
-        }
-    }
+    fun tryEnqueue(event: T, priority: Priority = Priority.NORMAL): EnqueueResult =
+        lanes.getValue(priority).tryEnqueue(event)
 
     /**
      * Enqueues [event] at [priority], honoring [overflowStrategy]. Only
@@ -250,21 +173,8 @@ class PriorityInMemoryQueue<T> internal constructor(
      * Defaults to [Priority.NORMAL] so callers migrating from [InMemoryQueue] keep working
      * unchanged.
      */
-    suspend fun enqueue(event: T, priority: Priority = Priority.NORMAL): EnqueueResult {
-        if (overflowStrategy != OverflowStrategy.BACKPRESSURE) {
-            return tryEnqueue(event, priority)
-        }
-
-        val levelCounters = counters.getValue(priority)
-        return try {
-            channels.getValue(priority).send(event)
-            levelCounters.enqueued.incrementAndGet()
-            levelCounters.depth.incrementAndGet()
-            EnqueueResult.Enqueued
-        } catch (e: ClosedSendChannelException) {
-            EnqueueResult.Closed
-        }
-    }
+    suspend fun enqueue(event: T, priority: Priority = Priority.NORMAL): EnqueueResult =
+        lanes.getValue(priority).enqueue(event)
 
     /**
      * Snapshot of a single [priority] level's counters, in the same shape as
@@ -276,21 +186,8 @@ class PriorityInMemoryQueue<T> internal constructor(
      * `"webhooks:HIGH"`), so per-level snapshots exported side by side remain distinguishable.
      * If no [name] was configured, this is `null` (there is nothing to suffix).
      */
-    fun metrics(priority: Priority): QueueMetrics {
-        val levelCounters = counters.getValue(priority)
-        return QueueMetrics(
-            name = name?.let { "$it:$priority" },
-            depth = levelCounters.depth.get(),
-            inFlight = levelCounters.inFlight.get(),
-            enqueued = levelCounters.enqueued.get(),
-            processed = levelCounters.processed.get(),
-            deadLettered = levelCounters.deadLettered.get(),
-            dropped = levelCounters.dropped.get(),
-            rejected = levelCounters.rejected.get(),
-            wouldBlock = levelCounters.wouldBlock.get(),
-            retries = levelCounters.retries.get(),
-        )
-    }
+    fun metrics(priority: Priority): QueueMetrics =
+        lanes.getValue(priority).metrics(name?.let { "$it:$priority" })
 
     /**
      * Aggregate snapshot across all [Priority] levels: each field is the sum of that field
@@ -320,7 +217,7 @@ class PriorityInMemoryQueue<T> internal constructor(
     suspend fun stop() {
         logger.debug("{}Stopping queue: draining buffers", logPrefix)
         for (priority in Priority.entries) {
-            channels.getValue(priority).close()
+            lanes.getValue(priority).channel.close()
         }
         workers.joinAll()
         logger.debug("{}Queue stopped", logPrefix)

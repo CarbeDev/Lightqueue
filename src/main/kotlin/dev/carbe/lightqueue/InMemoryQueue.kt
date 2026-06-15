@@ -1,13 +1,9 @@
 package dev.carbe.lightqueue
 
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.channels.BufferOverflow
-import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.channels.ClosedSendChannelException
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import org.slf4j.LoggerFactory
-import java.util.concurrent.atomic.AtomicLong
 
 class InMemoryQueue<T> internal constructor(
     scope: CoroutineScope,
@@ -31,16 +27,19 @@ class InMemoryQueue<T> internal constructor(
     // apart. A plain prefix is used rather than MDC because coroutines hop threads freely.
     private val logPrefix = name?.let { "[$it] " } ?: ""
 
-    // Gauges: go up and down as events flow through. The other counters are monotonic.
-    private val depth = AtomicLong()
-    private val inFlight = AtomicLong()
-    private val enqueued = AtomicLong()
-    private val processed = AtomicLong()
-    private val deadLettered = AtomicLong()
-    private val dropped = AtomicLong()
-    private val rejected = AtomicLong()
-    private val wouldBlock = AtomicLong()
-    private val retries = AtomicLong()
+    // The channel, counters, and EventProcessor, plus the enqueue/overflow/metrics logic that
+    // goes with them. See QueueLane.kt. logTag is empty: InMemoryQueue has only one lane, so
+    // its drop/buffer-full log lines carry no level tag (unlike PriorityInMemoryQueue's).
+    private val lane = QueueLane<T>(
+        capacity = capacity,
+        overflowStrategy = overflowStrategy,
+        onDropped = onDropped,
+        logPrefix = logPrefix,
+        logTag = "",
+        onProcess = onProcess,
+        retryPolicy = retryPolicy,
+        onDeadLetter = onDeadLetter,
+    )
 
     /**
      * Immutable snapshot of the queue's counters. Cheap to call; intended to be polled and
@@ -50,64 +49,20 @@ class InMemoryQueue<T> internal constructor(
      * eventually-consistent rather than a single atomic instant; the invariant
      * `enqueued = processed + deadLettered + dropped + inFlight + depth` holds at quiescence.
      */
-    fun metrics(): QueueMetrics = QueueMetrics(
-        name = name,
-        depth = depth.get(),
-        inFlight = inFlight.get(),
-        enqueued = enqueued.get(),
-        processed = processed.get(),
-        deadLettered = deadLettered.get(),
-        dropped = dropped.get(),
-        rejected = rejected.get(),
-        wouldBlock = wouldBlock.get(),
-        retries = retries.get(),
-    )
-
-    // Delegates the retry/dead-letter loop to the shared implementation, wired to this
-    // queue's own counters and logger prefix. See Processing.kt.
-    private val processor = EventProcessor(
-        onProcess = onProcess,
-        retryPolicy = retryPolicy,
-        onDeadLetter = onDeadLetter,
-        logPrefix = logPrefix,
-        onProcessed = { processed.incrementAndGet() },
-        onDeadLettered = { deadLettered.incrementAndGet() },
-        onRetry = { retries.incrementAndGet() },
-    )
-
-    private val channel =
-        Channel<T>(
-            capacity = capacity,
-            onBufferOverflow = when (overflowStrategy) {
-                OverflowStrategy.EVICT_OLDEST -> BufferOverflow.DROP_OLDEST
-                // REJECT relies on trySend failing on a full SUSPEND channel,
-                // so the caller can be told the event was rejected.
-                OverflowStrategy.REJECT, OverflowStrategy.BACKPRESSURE -> BufferOverflow.SUSPEND
-            },
-            onUndeliveredElement = { event ->
-                logger.debug("{}Event dropped before processing: {}", logPrefix, event)
-                // An EVICT_OLDEST eviction (or scope-cancellation abandonment) reaches the event
-                // here after it was already counted into depth. We must decrement depth as well as
-                // bumping dropped, otherwise the gauge drifts permanently upward.
-                dropped.incrementAndGet()
-                depth.decrementAndGet()
-                onDropped?.invoke(event)
-            },
-        )
+    fun metrics(): QueueMetrics = lane.metrics(name)
 
     private val workers = List(numberOfWorkers) { workerIndex ->
         scope.launch {
             logger.debug("{}Worker {} started (capacity={}, overflow={})", logPrefix, workerIndex, capacity, overflowStrategy)
 
-            for (event in channel) {
+            for (event in lane.channel) {
                 // Bump inFlight before decrementing depth so the invariant never transiently
                 // under-counts (the event is always accounted for in exactly one of the two).
-                inFlight.incrementAndGet()
-                depth.decrementAndGet()
+                lane.markInFlight()
                 try {
-                    processor.process(event)
+                    lane.process(event)
                 } finally {
-                    inFlight.decrementAndGet()
+                    lane.markDone()
                 }
             }
 
@@ -127,59 +82,18 @@ class InMemoryQueue<T> internal constructor(
      * A `Rejected` result never triggers `onDropped`: the event was never accepted into the
      * queue, so the caller still holds it and is responsible for it.
      */
-    fun tryEnqueue(event: T): EnqueueResult {
-        val result = channel.trySend(event)
-        return when {
-            result.isSuccess -> {
-                // Accepted: count it into the queue. An EVICT_OLDEST eviction triggered by this
-                // send is handled separately in onUndeliveredElement (dropped++ / depth--).
-                enqueued.incrementAndGet()
-                depth.incrementAndGet()
-                EnqueueResult.Enqueued
-            }
-            // A closed channel touches no counter: the event never entered the queue.
-            result.isClosed -> EnqueueResult.Closed
-            // Buffer full (only reachable for REJECT and BACKPRESSURE; EVICT_OLDEST drops the
-            // oldest and succeeds instead). Either way the event never entered the queue, so
-            // depth is left untouched — but the two cases mean different things:
-            overflowStrategy == OverflowStrategy.BACKPRESSURE -> {
-                // Not a policy rejection: a blocking enqueue() would have suspended and waited
-                // here. Counted separately so `rejected` stays a clean "refused by policy" signal.
-                logger.debug("{}Buffer full, tryEnqueue would block: {}", logPrefix, event)
-                wouldBlock.incrementAndGet()
-                EnqueueResult.Rejected
-            }
-            else -> {
-                logger.debug("{}Buffer full, rejecting event: {}", logPrefix, event)
-                rejected.incrementAndGet()
-                EnqueueResult.Rejected
-            }
-        }
-    }
+    fun tryEnqueue(event: T): EnqueueResult = lane.tryEnqueue(event)
 
     /**
      * Enqueues [event], honoring [overflowStrategy]. Only [OverflowStrategy.BACKPRESSURE]
      * suspends, waiting for room to become available; for every other strategy this behaves
      * like [tryEnqueue].
      */
-    suspend fun enqueue(event: T): EnqueueResult {
-        if (overflowStrategy != OverflowStrategy.BACKPRESSURE) {
-            return tryEnqueue(event)
-        }
-
-        return try {
-            channel.send(event)
-            enqueued.incrementAndGet()
-            depth.incrementAndGet()
-            EnqueueResult.Enqueued
-        } catch (e: ClosedSendChannelException) {
-            EnqueueResult.Closed
-        }
-    }
+    suspend fun enqueue(event: T): EnqueueResult = lane.enqueue(event)
 
     suspend fun stop() {
         logger.debug("{}Stopping queue: draining buffer", logPrefix)
-        channel.close()
+        lane.channel.close()
         workers.joinAll()
         logger.debug("{}Queue stopped", logPrefix)
     }

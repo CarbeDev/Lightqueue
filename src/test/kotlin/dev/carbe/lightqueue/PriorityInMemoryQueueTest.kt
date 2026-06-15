@@ -4,7 +4,10 @@ import io.kotest.assertions.throwables.shouldThrow
 import io.kotest.core.spec.style.FunSpec
 import io.kotest.matchers.collections.shouldContainExactly
 import io.kotest.matchers.shouldBe
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.runTest
+import java.util.concurrent.ConcurrentLinkedQueue
 
 class PriorityInMemoryQueueTest : FunSpec({
 
@@ -250,6 +253,95 @@ class PriorityInMemoryQueueTest : FunSpec({
             }
             anonymous.metrics().name shouldBe null
             anonymous.metrics(Priority.HIGH).name shouldBe null
+        }
+    }
+
+    test("multiple workers drain every level and stop leaves the aggregate invariant at quiescence") {
+        runTest {
+            // process is invoked from several worker coroutines concurrently, so a bare
+            // mutableListOf is not safe here (unlike the single-worker tests above).
+            val processed = ConcurrentLinkedQueue<Int>()
+            val queue = PriorityInMemoryQueue.create<Int>(backgroundScope) {
+                workers = 3
+                process { processed.add(it) }
+            }
+
+            // A few hundred events spread across all three levels, enqueued before stop().
+            val high = (0 until 100).toList()
+            val normal = (100 until 250).toList()
+            val low = (250 until 400).toList()
+            high.forEach { queue.enqueue(it, Priority.HIGH) }
+            normal.forEach { queue.enqueue(it, Priority.NORMAL) }
+            low.forEach { queue.enqueue(it, Priority.LOW) }
+
+            queue.stop()
+
+            // Every enqueued event was processed exactly once. No ordering assertion across
+            // levels: with several workers the strict top-down order is not guaranteed
+            // (documented in PriorityInMemoryQueue.nextEvent).
+            val all = (high + normal + low)
+            processed.size shouldBe all.size
+            processed.toSet() shouldBe all.toSet()
+
+            val aggregate = queue.metrics()
+            aggregate.enqueued shouldBe all.size
+            aggregate.processed shouldBe all.size
+            aggregate.inFlight shouldBe 0
+            aggregate.depth shouldBe 0
+            aggregate.deadLettered shouldBe 0
+            aggregate.dropped shouldBe 0
+            aggregate.enqueued shouldBe
+                aggregate.processed + aggregate.deadLettered + aggregate.dropped +
+                aggregate.inFlight + aggregate.depth
+        }
+    }
+
+    test("BACKPRESSURE enqueue suspends on a full level and resumes once a worker frees room") {
+        runTest {
+            val processed = ConcurrentLinkedQueue<Int>()
+            // The handler holds the worker for 100ms of virtual time on the very first event,
+            // keeping the single-slot buffer occupied while we probe the producer's state.
+            val queue = PriorityInMemoryQueue.create<Int>(backgroundScope) {
+                capacity = 1
+                overflowStrategy = OverflowStrategy.BACKPRESSURE
+                process { event ->
+                    if (event == 1) delay(100)
+                    processed.add(event)
+                }
+            }
+
+            // Event 1 is pulled by the worker, which suspends inside the 100ms handler delay;
+            // event 2 then fills the single buffer slot.
+            queue.enqueue(1, Priority.NORMAL) shouldBe EnqueueResult.Enqueued
+            testScheduler.advanceTimeBy(50) // worker is now parked mid-handler on event 1
+            queue.enqueue(2, Priority.NORMAL) shouldBe EnqueueResult.Enqueued
+
+            // Buffer full + the only worker still busy: this enqueue has nowhere to go and must
+            // suspend rather than drop or reject.
+            val producer = launch { queue.enqueue(3, Priority.NORMAL) }
+            testScheduler.advanceTimeBy(40) // still before the handler finishes (90ms < 100ms)
+            producer.isActive shouldBe true
+            queue.metrics(Priority.NORMAL).dropped shouldBe 0
+            queue.metrics(Priority.NORMAL).rejected shouldBe 0
+
+            // Let the handler finish (cross the 100ms mark): the worker drains event 2, freeing
+            // room, and the parked enqueue for event 3 resumes.
+            testScheduler.advanceTimeBy(100)
+            testScheduler.runCurrent()
+            producer.isActive shouldBe false
+
+            queue.stop()
+
+            // FIFO within the single NORMAL level, single worker => deterministic order.
+            processed.toList() shouldContainExactly listOf(1, 2, 3)
+            val metrics = queue.metrics(Priority.NORMAL)
+            metrics.enqueued shouldBe 3
+            metrics.processed shouldBe 3
+            metrics.dropped shouldBe 0
+            metrics.rejected shouldBe 0
+            metrics.wouldBlock shouldBe 0
+            metrics.depth shouldBe 0
+            metrics.inFlight shouldBe 0
         }
     }
 })
