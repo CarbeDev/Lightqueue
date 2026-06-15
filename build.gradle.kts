@@ -4,7 +4,7 @@ plugins {
 }
 
 group = "dev.carbe"
-version = "0.1.0"
+version = "0.2.0"
 
 repositories {
     mavenCentral()
@@ -16,7 +16,7 @@ dependencies {
 
     testImplementation(libs.kotest.runner.junit5)
     testImplementation(libs.kotlinx.coroutines.test)
-    testRuntimeOnly(libs.logback.classic)
+    testImplementation(libs.logback.classic)
 }
 
 // Gradle 9.x: do not use java { toolchain {} } — jvmTarget is set via KotlinCompile.compilerOptions.

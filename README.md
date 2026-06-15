@@ -8,7 +8,7 @@ overflow strategies — configured through a small DSL.
 
 ```kotlin
 dependencies {
-    implementation("dev.carbe:lightqueue:0.1.0")
+    implementation("dev.carbe:lightqueue:0.2.0")
 }
 ```
 
