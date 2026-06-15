@@ -41,6 +41,7 @@ class InMemoryQueue<T> internal constructor(
     private val deadLettered = AtomicLong()
     private val dropped = AtomicLong()
     private val rejected = AtomicLong()
+    private val wouldBlock = AtomicLong()
     private val retries = AtomicLong()
 
     /**
@@ -52,6 +53,7 @@ class InMemoryQueue<T> internal constructor(
      * `enqueued = processed + deadLettered + dropped + inFlight + depth` holds at quiescence.
      */
     fun metrics(): QueueMetrics = QueueMetrics(
+        name = name,
         depth = depth.get(),
         inFlight = inFlight.get(),
         enqueued = enqueued.get(),
@@ -59,6 +61,7 @@ class InMemoryQueue<T> internal constructor(
         deadLettered = deadLettered.get(),
         dropped = dropped.get(),
         rejected = rejected.get(),
+        wouldBlock = wouldBlock.get(),
         retries = retries.get(),
     )
 
@@ -164,9 +167,18 @@ class InMemoryQueue<T> internal constructor(
             }
             // A closed channel touches no counter: the event never entered the queue.
             result.isClosed -> EnqueueResult.Closed
+            // Buffer full (only reachable for REJECT and BACKPRESSURE; EVICT_OLDEST drops the
+            // oldest and succeeds instead). Either way the event never entered the queue, so
+            // depth is left untouched — but the two cases mean different things:
+            overflowStrategy == OverflowStrategy.BACKPRESSURE -> {
+                // Not a policy rejection: a blocking enqueue() would have suspended and waited
+                // here. Counted separately so `rejected` stays a clean "refused by policy" signal.
+                logger.debug("{}Buffer full, tryEnqueue would block: {}", logPrefix, event)
+                wouldBlock.incrementAndGet()
+                EnqueueResult.Rejected
+            }
             else -> {
                 logger.debug("{}Buffer full, rejecting event: {}", logPrefix, event)
-                // Rejected events never entered the queue, so depth is left untouched.
                 rejected.incrementAndGet()
                 EnqueueResult.Rejected
             }

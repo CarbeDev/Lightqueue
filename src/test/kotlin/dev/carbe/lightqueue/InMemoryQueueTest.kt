@@ -627,7 +627,7 @@ class InMemoryQueueTest : FunSpec({
         }
     }
 
-    test("rejected increments without touching depth or dropped, for REJECT and full BACKPRESSURE buffers") {
+    test("REJECT counts a full-buffer refusal as rejected, not wouldBlock") {
         runTest {
             val rejectQueue = InMemoryQueue.create<Int>(backgroundScope) {
                 process {}
@@ -642,10 +642,15 @@ class InMemoryQueueTest : FunSpec({
             rejectQueue.enqueue(3) shouldBe EnqueueResult.Rejected
 
             rejectQueue.metrics().rejected shouldBe 1
+            rejectQueue.metrics().wouldBlock shouldBe 0
             rejectQueue.metrics().depth shouldBe 2 // unchanged by the rejection
             rejectQueue.metrics().dropped shouldBe 0
             rejectQueue.metrics().enqueued shouldBe 2
+        }
+    }
 
+    test("BACKPRESSURE counts a non-blocking tryEnqueue on a full buffer as wouldBlock, not rejected") {
+        runTest {
             val backpressureQueue = InMemoryQueue.create<Int>(backgroundScope) {
                 process {}
                 capacity = 2
@@ -658,7 +663,8 @@ class InMemoryQueueTest : FunSpec({
             backpressureQueue.tryEnqueue(2)
             backpressureQueue.tryEnqueue(3) shouldBe EnqueueResult.Rejected
 
-            backpressureQueue.metrics().rejected shouldBe 1
+            backpressureQueue.metrics().wouldBlock shouldBe 1
+            backpressureQueue.metrics().rejected shouldBe 0 // not a policy rejection
             backpressureQueue.metrics().depth shouldBe 2
             backpressureQueue.metrics().dropped shouldBe 0
         }
@@ -766,6 +772,21 @@ class InMemoryQueueTest : FunSpec({
         } finally {
             slf4jLogger.detachAppender(appender)
             appender.stop()
+        }
+    }
+
+    test("the configured name is carried into the metrics snapshot") {
+        runTest {
+            val named = InMemoryQueue.create<Int>(backgroundScope) {
+                process {}
+                name = "webhooks"
+            }
+            named.metrics().name shouldBe "webhooks"
+
+            val anonymous = InMemoryQueue.create<Int>(backgroundScope) {
+                process {}
+            }
+            anonymous.metrics().name shouldBe null
         }
     }
 })
