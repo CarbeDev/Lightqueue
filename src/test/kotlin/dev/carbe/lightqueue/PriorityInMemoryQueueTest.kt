@@ -226,6 +226,32 @@ class PriorityInMemoryQueueTest : FunSpec({
         }
     }
 
+    test("cancelling a selected receiver before the worker body reports the event as dropped") {
+        runTest {
+            val droppedEvents = mutableListOf<Int>()
+            val ownerJob = Job()
+            val ownerScope = CoroutineScope(backgroundScope.coroutineContext + ownerJob)
+            val queue = PriorityInMemoryQueue.create<Int>(ownerScope) {
+                process {}
+                onDropped = { droppedEvents.add(it) }
+            }
+
+            // Park the worker in select, hand an event to the selected clause, then cancel
+            // before the dispatched worker continuation can enter the processing body.
+            testScheduler.runCurrent()
+            queue.enqueue(1, Priority.HIGH) shouldBe EnqueueResult.Enqueued
+            ownerJob.cancel()
+            testScheduler.runCurrent()
+
+            droppedEvents shouldContainExactly listOf(1)
+            val metrics = queue.metrics(Priority.HIGH)
+            metrics.enqueued shouldBe 1
+            metrics.dropped shouldBe 1
+            metrics.depth shouldBe 0
+            metrics.inFlight shouldBe 0
+        }
+    }
+
     test("an always-failing event is dead-lettered through the shared EventProcessor") {
         runTest {
             var invocations = 0
@@ -391,6 +417,34 @@ class PriorityInMemoryQueueTest : FunSpec({
             metrics.wouldBlock shouldBe 0
             metrics.depth shouldBe 0
             metrics.inFlight shouldBe 0
+        }
+    }
+
+    test("cancelling a suspended BACKPRESSURE enqueue does not report an unaccepted event as dropped") {
+        runTest {
+            val droppedEvents = mutableListOf<Int>()
+            val queue = PriorityInMemoryQueue.create<Int>(backgroundScope) {
+                capacity = 1
+                workers = 0
+                allowNoWorkers = true
+                overflowStrategy = OverflowStrategy.BACKPRESSURE
+                process {}
+                onDropped = { droppedEvents.add(it) }
+            }
+
+            queue.enqueue(1, Priority.NORMAL) shouldBe EnqueueResult.Enqueued
+            val producer = launch { queue.enqueue(2, Priority.NORMAL) }
+            testScheduler.runCurrent()
+            producer.isActive shouldBe true
+
+            producer.cancel()
+            producer.join()
+
+            droppedEvents shouldBe emptyList()
+            val metrics = queue.metrics(Priority.NORMAL)
+            metrics.enqueued shouldBe 1
+            metrics.depth shouldBe 1
+            metrics.dropped shouldBe 0
         }
     }
 

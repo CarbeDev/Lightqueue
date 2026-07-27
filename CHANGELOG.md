@@ -38,7 +38,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Cancelling the owning `CoroutineScope` now closes every queue lane immediately:
   buffered and interrupted in-flight events are reported through `onDropped`, future
   enqueues return `Closed`, and priority queues can no longer remain open after all
-  their workers have disappeared.
+  their workers have disappeared. This also covers prompt receiver cancellation after
+  a channel handoff but before the worker enters its processing body.
 - Cancelling a suspended `BACKPRESSURE` enqueue before it is accepted no longer calls
   `onDropped` or corrupts the `depth`/`dropped` metrics.
 

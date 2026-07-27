@@ -130,13 +130,15 @@ the backlog. lightqueue is in-memory: a crash or restart loses everything buffer
   predictable ordering over maximum throughput during retries.
 - **`onDropped` means definitive loss, and only that.** It fires when an event that
   was *accepted* into the queue is permanently lost: evicted by `EVICT_OLDEST`, or
-  abandoned in the buffer or interrupted in-flight when the owning scope is cancelled.
-  It is never invoked for `Rejected`, `Closed`, or a suspended `BACKPRESSURE` enqueue
-  cancelled before acceptance — the caller still owns those events.
+  abandoned in the buffer, interrupted in-flight, or handed to a worker whose
+  continuation is cancelled before processing begins. It is never invoked for
+  `Rejected`, `Closed`, or a suspended `BACKPRESSURE` enqueue cancelled before
+  acceptance — the caller still owns those events.
 - **The caller owns the lifecycle (structured concurrency).** Workers run in the
   `CoroutineScope` you pass to `create`. If you cancel that scope, every priority
   level is closed immediately, future enqueues return `Closed`, and accepted events
-  that cannot finish are reported through `onDropped`. This is an abort, not a drain.
+  that cannot start or finish are reported through `onDropped`. This is an abort,
+  not a drain.
 - **`stop()` drains but has no timeout.** It closes the queue to new events, then
   waits for the workers to finish everything already buffered — however long that
   takes. If you need a bounded shutdown, wrap the call in `withTimeout` yourself or

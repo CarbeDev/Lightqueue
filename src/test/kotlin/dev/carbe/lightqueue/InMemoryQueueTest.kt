@@ -177,6 +177,32 @@ class InMemoryQueueTest : FunSpec({
         }
     }
 
+    test("cancelling a receiver after handoff but before the worker body reports the event as dropped") {
+        runTest {
+            val droppedEvents = mutableListOf<Int>()
+            val ownerJob = Job()
+            val ownerScope = CoroutineScope(backgroundScope.coroutineContext + ownerJob)
+            val queue = InMemoryQueue.create<Int>(ownerScope) {
+                process {}
+                onDropped = { droppedEvents.add(it) }
+            }
+
+            // Park the worker in receive, then hand the event directly to its dispatched
+            // continuation without letting the loop body run.
+            testScheduler.runCurrent()
+            queue.enqueue(1) shouldBe EnqueueResult.Enqueued
+            ownerJob.cancel()
+            testScheduler.runCurrent()
+
+            droppedEvents shouldContainExactly listOf(1)
+            val metrics = queue.metrics()
+            metrics.enqueued shouldBe 1
+            metrics.dropped shouldBe 1
+            metrics.depth shouldBe 0
+            metrics.inFlight shouldBe 0
+        }
+    }
+
     test("cancellation from onDeadLetter does not count an already terminal event as dropped") {
         runTest {
             val queue = InMemoryQueue.create<Int>(backgroundScope) {

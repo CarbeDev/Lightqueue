@@ -1,10 +1,28 @@
 package dev.carbe.lightqueue
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.channels.ClosedSendChannelException
 import org.slf4j.Logger
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
+
+/**
+ * Wraps an event so enqueue completion and Channel undelivery can resolve their race without
+ * confusing an unaccepted, cancelled send with an accepted event lost by a cancelled receiver.
+ */
+internal class QueueEntry<T>(val event: T) {
+    val deliveryState = AtomicReference(DeliveryState.PENDING)
+}
+
+internal enum class DeliveryState {
+    PENDING,
+    ACCEPTED,
+    UNDELIVERED_PENDING,
+    DROPPED,
+    REJECTED,
+}
 
 /**
  * A single `{ channel + counters + EventProcessor }` triplet, plus the enqueue/overflow/metrics
@@ -45,7 +63,7 @@ internal class QueueLane<T>(
     private val retries = AtomicLong()
 
     val channel =
-        Channel<T>(
+        Channel<QueueEntry<T>>(
             capacity = capacity,
             onBufferOverflow = when (overflowStrategy) {
                 OverflowStrategy.EVICT_OLDEST -> BufferOverflow.DROP_OLDEST
@@ -53,17 +71,10 @@ internal class QueueLane<T>(
                 // so the caller can be told the event was rejected.
                 OverflowStrategy.REJECT, OverflowStrategy.BACKPRESSURE -> BufferOverflow.SUSPEND
             },
-            // A suspended BACKPRESSURE send can be cancelled before it is accepted. Such an
-            // element reaches onUndeliveredElement even though enqueue() has not incremented its
-            // counters yet, so treating it as dropped would corrupt depth. EVICT_OLDEST is the
-            // only strategy that needs this callback: its sends are non-suspending, and the
-            // callback always identifies an element that was previously accepted and counted.
-            onUndeliveredElement =
-                if (overflowStrategy == OverflowStrategy.EVICT_OLDEST) {
-                    { event -> markBufferedDropped(event) }
-                } else {
-                    null
-                },
+            // This callback covers both eviction and prompt receiver cancellation. The entry's
+            // state lets us defer the decision when enqueue() has not returned yet: a successful
+            // handoff is a drop, while a cancelled suspended send remains the caller's event.
+            onUndeliveredElement = ::markUndelivered,
         )
 
     // Delegates the retry/dead-letter loop to the shared implementation, wired to this
@@ -113,7 +124,113 @@ internal class QueueLane<T>(
         while (true) {
             val result = channel.tryReceive()
             if (!result.isSuccess) break
-            markBufferedDropped(result.getOrThrow())
+            markUndelivered(result.getOrThrow())
+        }
+    }
+
+    /**
+     * Resolves Channel undelivery against enqueue completion.
+     *
+     * The callback may run before the producer learns whether its send succeeded. In that case
+     * it records [DeliveryState.UNDELIVERED_PENDING], and the producer makes the final decision:
+     * successful send -> accepted then dropped; failed/cancelled send -> rejected, not dropped.
+     */
+    private fun markUndelivered(entry: QueueEntry<T>) {
+        while (true) {
+            when (entry.deliveryState.get()) {
+                DeliveryState.PENDING -> {
+                    if (entry.deliveryState.compareAndSet(
+                            DeliveryState.PENDING,
+                            DeliveryState.UNDELIVERED_PENDING,
+                        )
+                    ) {
+                        return
+                    }
+                }
+
+                DeliveryState.ACCEPTED -> {
+                    if (entry.deliveryState.compareAndSet(
+                            DeliveryState.ACCEPTED,
+                            DeliveryState.DROPPED,
+                        )
+                    ) {
+                        markBufferedDropped(entry.event)
+                        return
+                    }
+                }
+
+                DeliveryState.UNDELIVERED_PENDING,
+                DeliveryState.DROPPED,
+                DeliveryState.REJECTED,
+                -> return
+            }
+        }
+    }
+
+    private fun markAccepted(entry: QueueEntry<T>) {
+        while (true) {
+            when (entry.deliveryState.get()) {
+                DeliveryState.PENDING -> {
+                    if (entry.deliveryState.compareAndSet(
+                            DeliveryState.PENDING,
+                            DeliveryState.ACCEPTED,
+                        )
+                    ) {
+                        enqueued.incrementAndGet()
+                        depth.incrementAndGet()
+                        return
+                    }
+                }
+
+                DeliveryState.UNDELIVERED_PENDING -> {
+                    if (entry.deliveryState.compareAndSet(
+                            DeliveryState.UNDELIVERED_PENDING,
+                            DeliveryState.DROPPED,
+                        )
+                    ) {
+                        enqueued.incrementAndGet()
+                        depth.incrementAndGet()
+                        markBufferedDropped(entry.event)
+                        return
+                    }
+                }
+
+                DeliveryState.ACCEPTED,
+                DeliveryState.DROPPED,
+                DeliveryState.REJECTED,
+                -> error("Queue entry acceptance resolved more than once")
+            }
+        }
+    }
+
+    private fun markRejected(entry: QueueEntry<T>) {
+        while (true) {
+            when (entry.deliveryState.get()) {
+                DeliveryState.PENDING -> {
+                    if (entry.deliveryState.compareAndSet(
+                            DeliveryState.PENDING,
+                            DeliveryState.REJECTED,
+                        )
+                    ) {
+                        return
+                    }
+                }
+
+                DeliveryState.UNDELIVERED_PENDING -> {
+                    if (entry.deliveryState.compareAndSet(
+                            DeliveryState.UNDELIVERED_PENDING,
+                            DeliveryState.REJECTED,
+                        )
+                    ) {
+                        return
+                    }
+                }
+
+                DeliveryState.ACCEPTED,
+                DeliveryState.DROPPED,
+                DeliveryState.REJECTED,
+                -> error("Queue entry rejection resolved more than once")
+            }
         }
     }
 
@@ -146,21 +263,25 @@ internal class QueueLane<T>(
      * queue, so the caller still holds it and is responsible for it.
      */
     fun tryEnqueue(event: T): EnqueueResult {
-        val result = channel.trySend(event)
+        val entry = QueueEntry(event)
+        val result = channel.trySend(entry)
         return when {
             result.isSuccess -> {
-                // Accepted: count it into the queue. An EVICT_OLDEST eviction triggered by this
-                // send is handled separately in onUndeliveredElement (dropped++ / depth--).
-                enqueued.incrementAndGet()
-                depth.incrementAndGet()
+                // Resolve acceptance after Channel has made its delivery decision. If a cancelled
+                // receiver already reported the entry as undelivered, this also records the drop.
+                markAccepted(entry)
                 EnqueueResult.Enqueued
             }
             // A closed channel touches no counter: the event never entered the queue.
-            result.isClosed -> EnqueueResult.Closed
+            result.isClosed -> {
+                markRejected(entry)
+                EnqueueResult.Closed
+            }
             // Buffer full (only reachable for REJECT and BACKPRESSURE; EVICT_OLDEST drops the
             // oldest and succeeds instead). Either way the event never entered the queue, so
             // depth is left untouched — but the two cases mean different things:
             overflowStrategy == OverflowStrategy.BACKPRESSURE -> {
+                markRejected(entry)
                 // Not a policy rejection: a blocking enqueue() would have suspended and waited
                 // here. Counted separately so `rejected` stays a clean "refused by policy" signal.
                 logger.debug("{}Buffer full, tryEnqueue would block{}: {}", logPrefix, logTag, event)
@@ -168,6 +289,7 @@ internal class QueueLane<T>(
                 EnqueueResult.Rejected
             }
             else -> {
+                markRejected(entry)
                 logger.debug("{}Buffer full, rejecting event{}: {}", logPrefix, logTag, event)
                 rejected.incrementAndGet()
                 EnqueueResult.Rejected
@@ -185,13 +307,17 @@ internal class QueueLane<T>(
             return tryEnqueue(event)
         }
 
+        val entry = QueueEntry(event)
         return try {
-            channel.send(event)
-            enqueued.incrementAndGet()
-            depth.incrementAndGet()
+            channel.send(entry)
+            markAccepted(entry)
             EnqueueResult.Enqueued
         } catch (e: ClosedSendChannelException) {
+            markRejected(entry)
             EnqueueResult.Closed
+        } catch (e: CancellationException) {
+            markRejected(entry)
+            throw e
         }
     }
 

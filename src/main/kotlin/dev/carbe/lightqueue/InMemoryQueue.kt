@@ -67,7 +67,8 @@ class InMemoryQueue<T> internal constructor(
         scope.launch {
             logger.debug("{}Worker {} started (capacity={}, overflow={})", logPrefix, workerIndex, capacity, overflowStrategy)
 
-            for (event in lane.channel) {
+            for (entry in lane.channel) {
+                val event = entry.event
                 // Bump inFlight before decrementing depth so the invariant never transiently
                 // under-counts (the event is always accounted for in exactly one of the two).
                 lane.markInFlight()

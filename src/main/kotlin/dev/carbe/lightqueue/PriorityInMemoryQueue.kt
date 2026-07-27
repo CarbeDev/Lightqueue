@@ -66,7 +66,7 @@ class PriorityInMemoryQueue<T> internal constructor(
         }
 
     /** An event paired with the level it was read from, so a worker knows which lane to use. */
-    private data class Prioritized<T>(val event: T, val priority: Priority)
+    private data class Prioritized<T>(val entry: QueueEntry<T>, val priority: Priority)
 
     /**
      * Selects the next event to process, applying strict top-down priority order.
@@ -146,15 +146,16 @@ class PriorityInMemoryQueue<T> internal constructor(
             while (true) {
                 val prioritized = nextEvent() ?: break
                 val lane = lanes.getValue(prioritized.priority)
+                val event = prioritized.entry.event
 
                 // Bump inFlight before decrementing depth so the invariant never transiently
                 // under-counts (the event is always accounted for in exactly one of the two).
                 lane.markInFlight()
                 try {
-                    lane.process(prioritized.event)
+                    lane.process(event)
                 } catch (e: CancellationException) {
                     if (e !is TerminalEventCancellationException) {
-                        lane.markInFlightDropped(prioritized.event)
+                        lane.markInFlightDropped(event)
                     }
                     throw e
                 } finally {
