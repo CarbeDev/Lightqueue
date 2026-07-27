@@ -2,7 +2,18 @@ package dev.carbe.lightqueue
 
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
-import org.slf4j.LoggerFactory
+import org.slf4j.Logger
+
+/**
+ * Propagates cancellation after an event has already reached its dead-letter terminal state.
+ * Workers use this marker to avoid counting that same event as dropped as well.
+ */
+internal class TerminalEventCancellationException(cause: CancellationException) :
+    CancellationException(cause.message) {
+    init {
+        initCause(cause)
+    }
+}
 
 /**
  * Shared retry/dead-letter logic, extracted so [InMemoryQueue] and [PriorityInMemoryQueue]
@@ -17,14 +28,11 @@ internal class EventProcessor<T>(
     private val retryPolicy: RetryPolicy?,
     private val onDeadLetter: (suspend (T, Throwable) -> Unit)?,
     private val logPrefix: String,
+    private val logger: Logger,
     private val onProcessed: () -> Unit,
     private val onDeadLettered: () -> Unit,
     private val onRetry: () -> Unit,
 ) {
-    companion object {
-        private val logger = LoggerFactory.getLogger(EventProcessor::class.java)
-    }
-
     suspend fun process(event: T) {
         val maxAttempts = retryPolicy?.maxAttempts ?: 1
         lateinit var lastError: Throwable
@@ -55,7 +63,7 @@ internal class EventProcessor<T>(
         try {
             onDeadLetter?.invoke(event, lastError)
         } catch (e: CancellationException) {
-            throw e
+            throw TerminalEventCancellationException(e)
         } catch (e: Exception) {
             // A failing dead-letter callback must not take down the worker loop:
             // the event would simply be lost with no trace otherwise.

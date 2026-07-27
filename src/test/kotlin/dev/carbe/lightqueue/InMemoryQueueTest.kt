@@ -9,6 +9,10 @@ import io.kotest.matchers.collections.shouldContainExactly
 import io.kotest.matchers.collections.shouldHaveSize
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.types.shouldBeInstanceOf
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.currentTime
@@ -113,6 +117,82 @@ class InMemoryQueueTest : FunSpec({
 
             producer.isActive shouldBe true
             producer.cancel()
+            producer.join()
+
+            val metrics = queue.metrics()
+            metrics.enqueued shouldBe 2
+            metrics.depth shouldBe 2
+            metrics.dropped shouldBe 0
+        }
+    }
+
+    test("cancelling the worker scope closes the queue and drops buffered events") {
+        runTest {
+            val droppedEvents = mutableListOf<Int>()
+            val ownerJob = Job()
+            val ownerScope = CoroutineScope(backgroundScope.coroutineContext + ownerJob)
+            val queue = InMemoryQueue.create<Int>(ownerScope) {
+                process {}
+                onDropped = { droppedEvents.add(it) }
+            }
+
+            queue.enqueue(1)
+            queue.enqueue(2)
+            ownerJob.cancel()
+            testScheduler.runCurrent()
+
+            queue.tryEnqueue(3) shouldBe EnqueueResult.Closed
+            droppedEvents shouldContainExactly listOf(1, 2)
+            val metrics = queue.metrics()
+            metrics.enqueued shouldBe 2
+            metrics.dropped shouldBe 2
+            metrics.depth shouldBe 0
+            metrics.inFlight shouldBe 0
+        }
+    }
+
+    test("cancelling the worker scope records an in-flight event as dropped") {
+        runTest {
+            val droppedEvents = mutableListOf<Int>()
+            val ownerJob = Job()
+            val ownerScope = CoroutineScope(backgroundScope.coroutineContext + ownerJob)
+            val queue = InMemoryQueue.create<Int>(ownerScope) {
+                process { awaitCancellation() }
+                onDropped = { droppedEvents.add(it) }
+            }
+
+            queue.enqueue(1)
+            testScheduler.runCurrent()
+            queue.metrics().inFlight shouldBe 1
+
+            ownerJob.cancel()
+            testScheduler.runCurrent()
+
+            droppedEvents shouldContainExactly listOf(1)
+            val metrics = queue.metrics()
+            metrics.enqueued shouldBe 1
+            metrics.dropped shouldBe 1
+            metrics.depth shouldBe 0
+            metrics.inFlight shouldBe 0
+        }
+    }
+
+    test("cancellation from onDeadLetter does not count an already terminal event as dropped") {
+        runTest {
+            val queue = InMemoryQueue.create<Int>(backgroundScope) {
+                process { throw IllegalStateException("boom") }
+                onDeadLetter = { _, _ -> throw CancellationException("callback cancelled") }
+            }
+
+            queue.enqueue(1)
+            testScheduler.runCurrent()
+
+            val metrics = queue.metrics()
+            metrics.enqueued shouldBe 1
+            metrics.deadLettered shouldBe 1
+            metrics.dropped shouldBe 0
+            metrics.depth shouldBe 0
+            metrics.inFlight shouldBe 0
         }
     }
 
@@ -751,7 +831,7 @@ class InMemoryQueueTest : FunSpec({
         }
     }
 
-    test("queue name appears as a prefix in the SLF4J output") {
+    test("queue name and helper logs stay on the InMemoryQueue SLF4J category") {
         // Capture everything the InMemoryQueue logger emits via a logback ListAppender.
         val slf4jLogger = LoggerFactory.getLogger(InMemoryQueue::class.java) as Logger
         val appender = ListAppender<ILoggingEvent>().apply { start() }
@@ -760,15 +840,29 @@ class InMemoryQueueTest : FunSpec({
         try {
             runTest {
                 val queue = InMemoryQueue.create<Int>(backgroundScope) {
-                    process {}
+                    process { throw IllegalStateException("boom") }
                     name = "webhooks"
                 }
                 queue.enqueue(1)
                 queue.stop()
+
+                val rejectingQueue = InMemoryQueue.create<Int>(backgroundScope) {
+                    process {}
+                    name = "webhooks"
+                    capacity = 1
+                    workers = 0
+                    allowNoWorkers = true
+                    overflowStrategy = OverflowStrategy.REJECT
+                }
+                rejectingQueue.enqueue(1)
+                rejectingQueue.enqueue(2)
+                rejectingQueue.stop()
             }
 
             val messages = appender.list.map { it.formattedMessage }
             messages.any { it.startsWith("[webhooks] ") } shouldBe true
+            messages.any { "Attempt 1/1 failed" in it } shouldBe true
+            messages.any { "Buffer full, rejecting event" in it } shouldBe true
         } finally {
             slf4jLogger.detachAppender(appender)
             appender.stop()

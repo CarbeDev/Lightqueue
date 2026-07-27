@@ -1,9 +1,11 @@
 package dev.carbe.lightqueue
 
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import org.slf4j.LoggerFactory
+import java.util.concurrent.atomic.AtomicBoolean
 
 class InMemoryQueue<T> internal constructor(
     scope: CoroutineScope,
@@ -35,6 +37,7 @@ class InMemoryQueue<T> internal constructor(
         overflowStrategy = overflowStrategy,
         onDropped = onDropped,
         logPrefix = logPrefix,
+        logger = logger,
         logTag = "",
         onProcess = onProcess,
         retryPolicy = retryPolicy,
@@ -51,6 +54,15 @@ class InMemoryQueue<T> internal constructor(
      */
     fun metrics(): QueueMetrics = lane.metrics(name)
 
+    private val aborted = AtomicBoolean()
+
+    private fun abort() {
+        if (aborted.compareAndSet(false, true)) {
+            logger.debug("{}Worker scope cancelled: dropping buffered events", logPrefix)
+            lane.abort()
+        }
+    }
+
     private val workers = List(numberOfWorkers) { workerIndex ->
         scope.launch {
             logger.debug("{}Worker {} started (capacity={}, overflow={})", logPrefix, workerIndex, capacity, overflowStrategy)
@@ -61,12 +73,23 @@ class InMemoryQueue<T> internal constructor(
                 lane.markInFlight()
                 try {
                     lane.process(event)
+                } catch (e: CancellationException) {
+                    if (e !is TerminalEventCancellationException) {
+                        lane.markInFlightDropped(event)
+                    }
+                    throw e
                 } finally {
                     lane.markDone()
                 }
             }
 
             logger.debug("{}Worker {} stopped", logPrefix, workerIndex)
+        }.also { worker ->
+            // This also runs when the parent scope was already cancelled and the coroutine body
+            // never started, ensuring the channel cannot remain open without a consumer.
+            worker.invokeOnCompletion { cause ->
+                if (cause is CancellationException) abort()
+            }
         }
     }
 

@@ -1,11 +1,13 @@
 package dev.carbe.lightqueue
 
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.DelicateCoroutinesApi
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.selects.select
 import org.slf4j.LoggerFactory
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * A sibling of [InMemoryQueue] with [Priority]-aware scheduling: each [Priority] level gets
@@ -55,6 +57,7 @@ class PriorityInMemoryQueue<T> internal constructor(
                 overflowStrategy = overflowStrategy,
                 onDropped = onDropped,
                 logPrefix = logPrefix,
+                logger = logger,
                 logTag = " ($priority)",
                 onProcess = onProcess,
                 retryPolicy = retryPolicy,
@@ -115,13 +118,24 @@ class PriorityInMemoryQueue<T> internal constructor(
             val picked: Prioritized<T>? = select {
                 for (priority in openChannels) {
                     lanes.getValue(priority).channel.onReceiveCatching { result ->
-                        result.getOrNull()?.let { Prioritized(it, priority) }
+                        if (result.isSuccess) Prioritized(result.getOrThrow(), priority) else null
                     }
                 }
             }
             if (picked != null) return picked
             // `picked` is null when the channel we woke up on turned out to be closed (and
             // empty) by the time we received from it. Loop back to re-evaluate from step 1.
+        }
+    }
+
+    private val aborted = AtomicBoolean()
+
+    private fun abort() {
+        if (aborted.compareAndSet(false, true)) {
+            logger.debug("{}Worker scope cancelled: dropping buffered events", logPrefix)
+            for (priority in Priority.entries) {
+                lanes.getValue(priority).abort()
+            }
         }
     }
 
@@ -138,12 +152,22 @@ class PriorityInMemoryQueue<T> internal constructor(
                 lane.markInFlight()
                 try {
                     lane.process(prioritized.event)
+                } catch (e: CancellationException) {
+                    if (e !is TerminalEventCancellationException) {
+                        lane.markInFlightDropped(prioritized.event)
+                    }
+                    throw e
                 } finally {
                     lane.markDone()
                 }
             }
 
             logger.debug("{}Worker {} stopped", logPrefix, workerIndex)
+        }.also { worker ->
+            // Covers cancellation before the coroutine body has had a chance to start.
+            worker.invokeOnCompletion { cause ->
+                if (cause is CancellationException) abort()
+            }
         }
     }
 

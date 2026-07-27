@@ -33,6 +33,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `PriorityInMemoryQueue` so the two cannot drift apart. No behaviour change to
   `InMemoryQueue`.
 
+### Fixed
+
+- Cancelling the owning `CoroutineScope` now closes every queue lane immediately:
+  buffered and interrupted in-flight events are reported through `onDropped`, future
+  enqueues return `Closed`, and priority queues can no longer remain open after all
+  their workers have disappeared.
+- Cancelling a suspended `BACKPRESSURE` enqueue before it is accepted no longer calls
+  `onDropped` or corrupts the `depth`/`dropped` metrics.
+
 ## [0.2.0] - 2026-06-15
 
 ### Added

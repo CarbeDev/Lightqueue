@@ -1,12 +1,18 @@
 package dev.carbe.lightqueue
 
+import ch.qos.logback.classic.Logger
+import ch.qos.logback.classic.spi.ILoggingEvent
+import ch.qos.logback.core.read.ListAppender
 import io.kotest.assertions.throwables.shouldThrow
 import io.kotest.core.spec.style.FunSpec
 import io.kotest.matchers.collections.shouldContainExactly
 import io.kotest.matchers.shouldBe
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.runTest
+import org.slf4j.LoggerFactory
 import java.util.concurrent.ConcurrentLinkedQueue
 
 class PriorityInMemoryQueueTest : FunSpec({
@@ -65,6 +71,21 @@ class PriorityInMemoryQueueTest : FunSpec({
             queue.metrics(Priority.NORMAL).enqueued shouldBe 1
             queue.metrics(Priority.HIGH).enqueued shouldBe 0
             queue.metrics(Priority.LOW).enqueued shouldBe 0
+        }
+    }
+
+    test("nullable events are processed rather than mistaken for a closed select clause") {
+        runTest {
+            val processed = mutableListOf<String?>()
+            val queue = PriorityInMemoryQueue.create<String?>(backgroundScope) {
+                process { processed.add(it) }
+            }
+
+            queue.enqueue(null, Priority.HIGH)
+            queue.stop()
+
+            processed shouldContainExactly listOf(null)
+            queue.metrics(Priority.HIGH).processed shouldBe 1
         }
     }
 
@@ -174,6 +195,34 @@ class PriorityInMemoryQueueTest : FunSpec({
             processed.toSet() shouldBe setOf(1, 2, 3)
             queue.metrics().depth shouldBe 0
             queue.metrics().inFlight shouldBe 0
+        }
+    }
+
+    test("cancelling the worker scope closes every level and drops buffered events") {
+        runTest {
+            val droppedEvents = mutableListOf<Int>()
+            val ownerJob = Job()
+            val ownerScope = CoroutineScope(backgroundScope.coroutineContext + ownerJob)
+            val queue = PriorityInMemoryQueue.create<Int>(ownerScope) {
+                process {}
+                onDropped = { droppedEvents.add(it) }
+            }
+
+            queue.enqueue(1, Priority.HIGH)
+            queue.enqueue(2, Priority.NORMAL)
+            queue.enqueue(3, Priority.LOW)
+            ownerJob.cancel()
+            testScheduler.runCurrent()
+
+            Priority.entries.forEach { priority ->
+                queue.tryEnqueue(4, priority) shouldBe EnqueueResult.Closed
+            }
+            droppedEvents.toSet() shouldBe setOf(1, 2, 3)
+            val metrics = queue.metrics()
+            metrics.enqueued shouldBe 3
+            metrics.dropped shouldBe 3
+            metrics.depth shouldBe 0
+            metrics.inFlight shouldBe 0
         }
     }
 
@@ -342,6 +391,42 @@ class PriorityInMemoryQueueTest : FunSpec({
             metrics.wouldBlock shouldBe 0
             metrics.depth shouldBe 0
             metrics.inFlight shouldBe 0
+        }
+    }
+
+    test("helper logs stay on the PriorityInMemoryQueue SLF4J category") {
+        val slf4jLogger = LoggerFactory.getLogger(PriorityInMemoryQueue::class.java) as Logger
+        val appender = ListAppender<ILoggingEvent>().apply { start() }
+        slf4jLogger.addAppender(appender)
+
+        try {
+            runTest {
+                val queue = PriorityInMemoryQueue.create<Int>(backgroundScope) {
+                    process { throw IllegalStateException("boom") }
+                    name = "priority"
+                }
+                queue.enqueue(1, Priority.HIGH)
+                queue.stop()
+
+                val rejectingQueue = PriorityInMemoryQueue.create<Int>(backgroundScope) {
+                    process {}
+                    name = "priority"
+                    capacity = 1
+                    workers = 0
+                    allowNoWorkers = true
+                    overflowStrategy = OverflowStrategy.REJECT
+                }
+                rejectingQueue.enqueue(1, Priority.LOW)
+                rejectingQueue.enqueue(2, Priority.LOW)
+                rejectingQueue.stop()
+            }
+
+            val messages = appender.list.map { it.formattedMessage }
+            messages.any { "Attempt 1/1 failed" in it } shouldBe true
+            messages.any { "Buffer full, rejecting event (LOW)" in it } shouldBe true
+        } finally {
+            slf4jLogger.detachAppender(appender)
+            appender.stop()
         }
     }
 })

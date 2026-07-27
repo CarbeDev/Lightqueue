@@ -3,7 +3,7 @@ package dev.carbe.lightqueue
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.channels.ClosedSendChannelException
-import org.slf4j.LoggerFactory
+import org.slf4j.Logger
 import java.util.concurrent.atomic.AtomicLong
 
 /**
@@ -16,17 +16,16 @@ import java.util.concurrent.atomic.AtomicLong
  * `inFlight`/`depth` move relative to picking the next event), `stop()` (so callers decide how
  * many channels to close and in which order), and metrics aggregation across levels.
  *
- * Logger note: drop/buffer-full messages are logged through [QueueLane]'s own logger
- * (`QueueLane::class.java`) rather than the owning queue's. The only test that asserts on a
- * specific logger only checks the "Worker N started/stopped" lines, which remain in
- * [InMemoryQueue]/[PriorityInMemoryQueue] (the worker loop didn't move), so this is observably
- * unchanged from the outside. [logTag] reproduces the previous message text exactly.
+ * [logger] is supplied by the owning queue so extracting this helper does not change the
+ * externally-visible SLF4J category. [logTag] adds the priority to messages emitted for a
+ * [PriorityInMemoryQueue] lane.
  */
 internal class QueueLane<T>(
     capacity: Int,
     private val overflowStrategy: OverflowStrategy,
     private val onDropped: ((T) -> Unit)?,
     private val logPrefix: String,
+    private val logger: Logger,
     // "" for InMemoryQueue; " (HIGH)" etc. for PriorityInMemoryQueue, inserted right before the
     // trailing ": {}" so the two queues' log lines stay byte-for-byte identical to before.
     private val logTag: String,
@@ -34,10 +33,6 @@ internal class QueueLane<T>(
     retryPolicy: RetryPolicy?,
     onDeadLetter: (suspend (T, Throwable) -> Unit)?,
 ) {
-    companion object {
-        private val logger = LoggerFactory.getLogger(QueueLane::class.java)
-    }
-
     // Gauges: go up and down as events flow through. The other counters are monotonic.
     private val depth = AtomicLong()
     private val inFlight = AtomicLong()
@@ -58,15 +53,17 @@ internal class QueueLane<T>(
                 // so the caller can be told the event was rejected.
                 OverflowStrategy.REJECT, OverflowStrategy.BACKPRESSURE -> BufferOverflow.SUSPEND
             },
-            onUndeliveredElement = { event ->
-                logger.debug("{}Event dropped before processing{}: {}", logPrefix, logTag, event)
-                // An EVICT_OLDEST eviction (or scope-cancellation abandonment) reaches the event
-                // here after it was already counted into depth. We must decrement depth as well as
-                // bumping dropped, otherwise the gauge drifts permanently upward.
-                dropped.incrementAndGet()
-                depth.decrementAndGet()
-                onDropped?.invoke(event)
-            },
+            // A suspended BACKPRESSURE send can be cancelled before it is accepted. Such an
+            // element reaches onUndeliveredElement even though enqueue() has not incremented its
+            // counters yet, so treating it as dropped would corrupt depth. EVICT_OLDEST is the
+            // only strategy that needs this callback: its sends are non-suspending, and the
+            // callback always identifies an element that was previously accepted and counted.
+            onUndeliveredElement =
+                if (overflowStrategy == OverflowStrategy.EVICT_OLDEST) {
+                    { event -> markBufferedDropped(event) }
+                } else {
+                    null
+                },
         )
 
     // Delegates the retry/dead-letter loop to the shared implementation, wired to this
@@ -76,6 +73,7 @@ internal class QueueLane<T>(
         retryPolicy = retryPolicy,
         onDeadLetter = onDeadLetter,
         logPrefix = logPrefix,
+        logger = logger,
         onProcessed = { processed.incrementAndGet() },
         onDeadLettered = { deadLettered.incrementAndGet() },
         onRetry = { retries.incrementAndGet() },
@@ -95,6 +93,44 @@ internal class QueueLane<T>(
     /** Bumps the gauges to reflect a worker being done with the event it was processing. */
     fun markDone() {
         inFlight.decrementAndGet()
+    }
+
+    /** Records an accepted in-flight event that was interrupted by worker cancellation. */
+    fun markInFlightDropped(event: T) {
+        dropped.incrementAndGet()
+        notifyDropped(event)
+    }
+
+    /**
+     * Stops accepting new events and records every still-buffered event as dropped.
+     *
+     * Closing first also resumes suspended BACKPRESSURE senders with [EnqueueResult.Closed].
+     * Those pending sends were never counted and are deliberately not reported through
+     * `onDropped`.
+     */
+    fun abort() {
+        channel.close()
+        while (true) {
+            val result = channel.tryReceive()
+            if (!result.isSuccess) break
+            markBufferedDropped(result.getOrThrow())
+        }
+    }
+
+    private fun markBufferedDropped(event: T) {
+        logger.debug("{}Event dropped before processing{}: {}", logPrefix, logTag, event)
+        dropped.incrementAndGet()
+        depth.decrementAndGet()
+        notifyDropped(event)
+    }
+
+    private fun notifyDropped(event: T) {
+        try {
+            onDropped?.invoke(event)
+        } catch (e: Exception) {
+            // Lifecycle cleanup must not be interrupted by an observer callback.
+            logger.error("{}onDropped callback failed for event{}: {}", logPrefix, logTag, event, e)
+        }
     }
 
     /**
