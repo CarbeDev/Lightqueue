@@ -36,7 +36,10 @@ tasks.withType<Test> {
 }
 
 mavenPublishing {
-    publishToMavenCentral(com.vanniktech.maven.publish.SonatypeHost.CENTRAL_PORTAL)
+    publishToMavenCentral(
+        com.vanniktech.maven.publish.SonatypeHost.CENTRAL_PORTAL,
+        automaticRelease = true,
+    )
     signAllPublications()
 
     coordinates("dev.carbe", "lightqueue", version.toString())

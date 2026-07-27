@@ -20,8 +20,7 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v4
 
-      # Stages the artifacts on the Central Portal. The release is then published
-      # manually from https://central.sonatype.com (deployments view).
+      # Uploads, validates, and automatically releases the artifacts on Maven Central.
       - run: ./gradlew publishToMavenCentral --no-configuration-cache
         env:
           ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
