@@ -8,6 +8,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.selects.select
 import org.slf4j.LoggerFactory
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.time.Duration
 
 /**
  * A sibling of [InMemoryQueue] with [Priority]-aware scheduling: each [Priority] level gets
@@ -25,6 +26,7 @@ class PriorityInMemoryQueue<T> internal constructor(
     numberOfWorkers: Int,
     private val onDeadLetter: (suspend (T, Throwable) -> Unit)?,
     private val retryPolicy: RetryPolicy?,
+    private val attemptTimeout: Duration?,
     private val overflowStrategy: OverflowStrategy,
     private val onDropped: ((T) -> Unit)?,
     capacity: Int,
@@ -61,6 +63,7 @@ class PriorityInMemoryQueue<T> internal constructor(
                 logTag = " ($priority)",
                 onProcess = onProcess,
                 retryPolicy = retryPolicy,
+                attemptTimeout = attemptTimeout,
                 onDeadLetter = onDeadLetter,
             )
         }
@@ -236,6 +239,7 @@ class PriorityInMemoryQueue<T> internal constructor(
             rejected = perLevel.sumOf { it.rejected },
             wouldBlock = perLevel.sumOf { it.wouldBlock },
             retries = perLevel.sumOf { it.retries },
+            timedOut = perLevel.sumOf { it.timedOut },
         )
     }
 

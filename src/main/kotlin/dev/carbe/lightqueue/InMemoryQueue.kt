@@ -6,6 +6,7 @@ import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import org.slf4j.LoggerFactory
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.time.Duration
 
 class InMemoryQueue<T> internal constructor(
     scope: CoroutineScope,
@@ -13,6 +14,7 @@ class InMemoryQueue<T> internal constructor(
     numberOfWorkers: Int,
     private val onDeadLetter: (suspend (T, Throwable) -> Unit)?,
     private val retryPolicy: RetryPolicy?,
+    private val attemptTimeout: Duration?,
     private val overflowStrategy: OverflowStrategy,
     private val onDropped: ((T) -> Unit)?,
     capacity: Int,
@@ -41,6 +43,7 @@ class InMemoryQueue<T> internal constructor(
         logTag = "",
         onProcess = onProcess,
         retryPolicy = retryPolicy,
+        attemptTimeout = attemptTimeout,
         onDeadLetter = onDeadLetter,
     )
 

@@ -1,6 +1,7 @@
 package dev.carbe.lightqueue
 
 import kotlinx.coroutines.CoroutineScope
+import kotlin.time.Duration
 
 class PriorityQueueDsl<T> internal constructor(private val scope: CoroutineScope) {
     /** Applied to EACH [Priority] level's channel, not shared across levels. */
@@ -27,6 +28,22 @@ class PriorityQueueDsl<T> internal constructor(private val scope: CoroutineScope
      */
     var onDropped: ((T) -> Unit)? = null
 
+    /**
+     * Maximum duration of a *single* [process] attempt, applied identically to every [Priority]
+     * level. `null` (the default) means no timeout.
+     *
+     * The budget is per attempt, not per event: with a retry policy, each attempt gets a fresh
+     * timeout, and the backoff delay between attempts is not counted against it. An attempt that
+     * runs out of time is cancelled and treated like any other failure — it is retried if
+     * attempts remain, and otherwise dead-lettered with an [AttemptTimeoutException] cause.
+     *
+     * Enforcement is cooperative, and a fully blocking handler escapes it: cancellation only
+     * takes effect at a suspension point, so a handler that never suspends runs to completion and
+     * its result wins — the event is counted as processed and [QueueMetrics.timedOut] is not
+     * incremented. A handler that merely *catches* the cancellation still counts as timed out.
+     */
+    var attemptTimeout: Duration? = null
+
     private var onProcess: (suspend (T) -> Unit)? = null
     private var retryPolicy: RetryPolicy? = null
 
@@ -51,6 +68,10 @@ class PriorityQueueDsl<T> internal constructor(private val scope: CoroutineScope
             require(workers >= 1) { "workers must be >= 1, but was $workers" }
         }
 
+        attemptTimeout?.let {
+            require(it > Duration.ZERO) { "attemptTimeout must be > 0, but was $it" }
+        }
+
         val onProcess = requireNotNull(onProcess) { "process must be configured" }
 
         return PriorityInMemoryQueue(
@@ -59,6 +80,7 @@ class PriorityQueueDsl<T> internal constructor(private val scope: CoroutineScope
             workers,
             onDeadLetter,
             retryPolicy,
+            attemptTimeout,
             overflowStrategy ?: OverflowStrategy.BACKPRESSURE,
             onDropped,
             capacity,

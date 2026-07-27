@@ -5,6 +5,26 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-07-27
+
+### Added
+
+- `attemptTimeout` on both `QueueDsl` and `PriorityQueueDsl`: an optional `Duration`
+  bounding a **single** processing attempt. `null` (the default) keeps the previous
+  unbounded behaviour, and a non-positive value is rejected when the queue is created.
+  The budget is per attempt, not per event — with a retry policy each attempt gets a
+  fresh one, and the backoff delay between attempts is not charged against it.
+  Enforcement is cooperative: a handler that blocks its thread and never suspends
+  cannot be cancelled, and its result still counts as processed.
+- An attempt that runs out of time is cancelled and treated as an ordinary failure:
+  retried while attempts remain, then dead-lettered with a new public
+  `AttemptTimeoutException(timeout)` cause. The worker survives and moves on to the
+  next event, and the `enqueued = processed + deadLettered + dropped + inFlight +
+  depth` invariant is unaffected.
+- `QueueMetrics.timedOut`, counting timed-out attempts. Like `retries` it counts
+  attempts rather than events, so it sits outside the invariant. It defaults to `0`,
+  so existing positional `QueueMetrics` construction keeps compiling.
+
 ## [0.3.0] - 2026-07-27
 
 ### Added
@@ -72,6 +92,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   overflow strategies (`BACKPRESSURE`, `REJECT`, `EVICT_OLDEST`) — all configured through a
   small DSL.
 
+[0.4.0]: https://github.com/CarbeDev/Lightqueue/releases/tag/v0.4.0
 [0.3.0]: https://github.com/CarbeDev/Lightqueue/releases/tag/v0.3.0
 [0.2.0]: https://github.com/CarbeDev/Lightqueue/releases/tag/v0.2.0
 [0.1.0]: https://github.com/CarbeDev/Lightqueue/releases/tag/v0.1.0

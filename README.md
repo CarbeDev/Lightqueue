@@ -8,7 +8,7 @@ overflow strategies — configured through a small DSL.
 
 ```kotlin
 dependencies {
-    implementation("dev.carbe:lightqueue:0.3.0")
+    implementation("dev.carbe:lightqueue:0.4.0")
 }
 ```
 
@@ -33,6 +33,8 @@ val queue = InMemoryQueue.create<Event>(scope) {
         backoff = Backoff.exponential(100.milliseconds)
     }
 
+    attemptTimeout = 5.seconds // budget for ONE attempt; unset = no timeout
+
     onDeadLetter = { event, cause -> log.error("gave up on $event", cause) }
     onDropped = { event -> metrics.dropped(event) }
 }
@@ -48,6 +50,52 @@ Overflow strategies:
 - `BACKPRESSURE` (default) — `enqueue` suspends until there is room.
 - `REJECT` — `enqueue`/`tryEnqueue` return `EnqueueResult.Rejected` when full.
 - `EVICT_OLDEST` — the oldest buffered event is evicted (reported via `onDropped`) to make room.
+
+## Timeouts
+
+`attemptTimeout` bounds a **single** processing attempt. It is unset by default, and
+available on both `InMemoryQueue` and `PriorityInMemoryQueue` (where it applies
+identically to every priority level).
+
+```kotlin
+val queue = InMemoryQueue.create<Event>(scope) {
+    attemptTimeout = 5.seconds
+
+    process { event -> callFlakyApi(event) }
+
+    retryPolicy {
+        maxAttempts = 3
+        backoff = Backoff.exponential(100.milliseconds)
+    }
+
+    onDeadLetter = { event, cause ->
+        if (cause is AttemptTimeoutException) log.error("$event never finished in ${cause.timeout}")
+    }
+}
+```
+
+- **The budget is per attempt, not per event.** With `maxAttempts = 3` above, the
+  handler gets 5 seconds *each time*, and the backoff between attempts is not charged
+  against it. The worst case for one event is therefore 3 × 5s plus the backoff, not 5s.
+- **A timeout is an ordinary failure.** The attempt is cancelled, retried if attempts
+  remain, and otherwise dead-lettered with an `AttemptTimeoutException` cause — a plain
+  `Exception`, not a `CancellationException`, so you can handle it like any other. The
+  worker survives and picks up the next event; `onDropped` is never involved.
+- **Cancellation is cooperative, and a fully blocking handler escapes the timeout
+  entirely.** The timeout cancels the coroutine running your handler, which only takes
+  effect at a suspension point. A handler that blocks its thread and *never suspends*
+  (`Thread.sleep`, a blocking JDBC or HTTP call) cannot be interrupted — and because it
+  eventually returns a result, that result wins: the event is counted as **processed**,
+  `timedOut` stays at zero, and the only trace is that the attempt took longer than its
+  budget. The timeout is not a wall clock over your handler; it is a cancellation
+  request your handler has to be able to honour. Move genuinely blocking work to
+  `withContext(Dispatchers.IO)` and make it interruptible (or poll `ensureActive()`) if
+  you want the budget enforced.
+- A handler that *catches* the cancellation and returns normally does not escape:
+  the attempt is still counted as timed out and dead-lettered.
+- **Metrics**: `QueueMetrics.timedOut` counts timed-out *attempts*, like `retries` —
+  one event that times out on all three attempts contributes 3 to `timedOut` and 1 to
+  `deadLettered`.
 
 ## Priorities
 
@@ -128,6 +176,11 @@ the backlog. lightqueue is in-memory: a crash or restart loses everything buffer
   is processing the event, so ordering is preserved per worker — but a long backoff
   blocks that worker from picking up the next event. This is a deliberate trade-off:
   predictable ordering over maximum throughput during retries.
+- **`attemptTimeout` bounds an attempt, not an event.** A per-event deadline would have
+  to be split across retries and backoff, making each individual attempt's budget
+  depend on how the previous ones failed. Bounding the attempt keeps the guarantee the
+  handler actually cares about — "you get 5 seconds" — and leaves the total cost per
+  event as the product of `maxAttempts` and the timeout, which the caller chooses.
 - **`onDropped` means definitive loss, and only that.** It fires when an event that
   was *accepted* into the queue is permanently lost: evicted by `EVICT_OLDEST`, or
   abandoned in the buffer, interrupted in-flight, or handed to a worker whose

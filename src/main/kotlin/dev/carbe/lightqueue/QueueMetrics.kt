@@ -10,8 +10,9 @@ package dev.carbe.lightqueue
  * enqueued = processed + deadLettered + dropped + inFlight + depth
  * ```
  *
- * [rejected], [wouldBlock] and [retries] sit outside the invariant: rejected and would-block
- * events never entered the queue, and retries count re-executions rather than events.
+ * [rejected], [wouldBlock], [retries] and [timedOut] sit outside the invariant: rejected and
+ * would-block events never entered the queue, while retries and timeouts count attempts rather
+ * than events.
  */
 data class QueueMetrics(
     val name: String?,
@@ -30,4 +31,10 @@ data class QueueMetrics(
      */
     val wouldBlock: Long,
     val retries: Long,
+    /**
+     * Processing attempts abandoned because they exceeded the configured `attemptTimeout`.
+     * Like [retries], this counts attempts: a single event retried three times and timing out
+     * every time contributes 3 here and 1 to [deadLettered].
+     */
+    val timedOut: Long = 0,
 )
