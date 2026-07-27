@@ -7,6 +7,7 @@ import kotlinx.coroutines.channels.ClosedSendChannelException
 import org.slf4j.Logger
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
+import kotlin.time.Duration
 
 /**
  * Wraps an event so enqueue completion and Channel undelivery can resolve their race without
@@ -49,6 +50,7 @@ internal class QueueLane<T>(
     private val logTag: String,
     onProcess: suspend (T) -> Unit,
     retryPolicy: RetryPolicy?,
+    attemptTimeout: Duration?,
     onDeadLetter: (suspend (T, Throwable) -> Unit)?,
 ) {
     // Gauges: go up and down as events flow through. The other counters are monotonic.
@@ -82,6 +84,7 @@ internal class QueueLane<T>(
     private val processor = EventProcessor(
         onProcess = onProcess,
         retryPolicy = retryPolicy,
+        attemptTimeout = attemptTimeout,
         onDeadLetter = onDeadLetter,
         logPrefix = logPrefix,
         logger = logger,

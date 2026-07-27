@@ -23,6 +23,7 @@ val queue = InMemoryQueue.create<Event>(scope) {
     capacity = 100
     workers = 3
     overflowStrategy = OverflowStrategy.BACKPRESSURE
+    attemptTimeout = 5.seconds // independently applied to every attempt
 
     process { event ->
         handle(event) // suspend-friendly
@@ -128,6 +129,11 @@ the backlog. lightqueue is in-memory: a crash or restart loses everything buffer
   is processing the event, so ordering is preserved per worker — but a long backoff
   blocks that worker from picking up the next event. This is a deliberate trade-off:
   predictable ordering over maximum throughput during retries.
+- **The attempt timeout is per execution and cooperative.** `attemptTimeout` limits each
+  invocation of `process` independently; retry backoff time is not counted. An expiration
+  follows the normal retry/dead-letter path, with `AttemptTimeoutException` as the cause.
+  Like coroutine cancellation generally, it cannot interrupt blocking code that neither
+  suspends nor checks for cancellation.
 - **`onDropped` means definitive loss, and only that.** It fires when an event that
   was *accepted* into the queue is permanently lost: evicted by `EVICT_OLDEST`, or
   abandoned in the buffer, interrupted in-flight, or handed to a worker whose

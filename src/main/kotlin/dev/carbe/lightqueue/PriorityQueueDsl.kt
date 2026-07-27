@@ -1,11 +1,20 @@
 package dev.carbe.lightqueue
 
 import kotlinx.coroutines.CoroutineScope
+import kotlin.time.Duration
 
 class PriorityQueueDsl<T> internal constructor(private val scope: CoroutineScope) {
     /** Applied to EACH [Priority] level's channel, not shared across levels. */
     var capacity: Int = 100
     var workers: Int = 1
+
+    /**
+     * Optional timeout applied independently to each invocation of [process].
+     *
+     * Retry backoff is outside this timeout. When an attempt expires it fails with
+     * [AttemptTimeoutException] and follows the normal retry/dead-letter path.
+     */
+    var attemptTimeout: Duration? = null
 
     /**
      * Optional queue name, prefixed onto the SLF4J log statements (e.g. `[webhooks] Worker 0
@@ -52,6 +61,7 @@ class PriorityQueueDsl<T> internal constructor(private val scope: CoroutineScope
         }
 
         val onProcess = requireNotNull(onProcess) { "process must be configured" }
+        validateAttemptTimeout(attemptTimeout)
 
         return PriorityInMemoryQueue(
             scope,
@@ -59,6 +69,7 @@ class PriorityQueueDsl<T> internal constructor(private val scope: CoroutineScope
             workers,
             onDeadLetter,
             retryPolicy,
+            attemptTimeout,
             overflowStrategy ?: OverflowStrategy.BACKPRESSURE,
             onDropped,
             capacity,

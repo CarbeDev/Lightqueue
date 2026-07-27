@@ -2,7 +2,9 @@ package dev.carbe.lightqueue
 
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withTimeoutOrNull
 import org.slf4j.Logger
+import kotlin.time.Duration
 
 /**
  * Propagates cancellation after an event has already reached its dead-letter terminal state.
@@ -26,6 +28,7 @@ internal class TerminalEventCancellationException(cause: CancellationException) 
 internal class EventProcessor<T>(
     private val onProcess: suspend (T) -> Unit,
     private val retryPolicy: RetryPolicy?,
+    private val attemptTimeout: Duration?,
     private val onDeadLetter: (suspend (T, Throwable) -> Unit)?,
     private val logPrefix: String,
     private val logger: Logger,
@@ -33,6 +36,21 @@ internal class EventProcessor<T>(
     private val onDeadLettered: () -> Unit,
     private val onRetry: () -> Unit,
 ) {
+    private suspend fun processAttempt(event: T) {
+        val timeout = attemptTimeout
+        if (timeout == null) {
+            onProcess(event)
+            return
+        }
+
+        val completed = withTimeoutOrNull(timeout) {
+            onProcess(event)
+            true
+        } ?: false
+
+        if (!completed) throw AttemptTimeoutException(timeout)
+    }
+
     suspend fun process(event: T) {
         val maxAttempts = retryPolicy?.maxAttempts ?: 1
         lateinit var lastError: Throwable
@@ -41,7 +59,7 @@ internal class EventProcessor<T>(
             // Every attempt past the first is a retry.
             if (attempt > 1) onRetry()
             try {
-                onProcess(event)
+                processAttempt(event)
                 onProcessed()
                 return
             } catch (e: CancellationException) {

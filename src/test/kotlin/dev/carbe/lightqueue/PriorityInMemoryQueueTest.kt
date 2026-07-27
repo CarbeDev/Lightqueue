@@ -6,14 +6,18 @@ import ch.qos.logback.core.read.ListAppender
 import io.kotest.assertions.throwables.shouldThrow
 import io.kotest.core.spec.style.FunSpec
 import io.kotest.matchers.collections.shouldContainExactly
+import io.kotest.matchers.types.shouldBeInstanceOf
 import io.kotest.matchers.shouldBe
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.test.currentTime
 import kotlinx.coroutines.test.runTest
 import org.slf4j.LoggerFactory
 import java.util.concurrent.ConcurrentLinkedQueue
+import kotlin.time.Duration.Companion.milliseconds
 
 class PriorityInMemoryQueueTest : FunSpec({
 
@@ -277,6 +281,31 @@ class PriorityInMemoryQueueTest : FunSpec({
             queue.metrics(Priority.HIGH).retries shouldBe 2
             queue.metrics(Priority.NORMAL).deadLettered shouldBe 0
             queue.metrics().deadLettered shouldBe 1
+        }
+    }
+
+    test("attempt timeout is applied to priority queue attempts and the worker continues") {
+        runTest {
+            val processed = mutableListOf<Int>()
+            val deadLetterCauses = mutableListOf<Throwable>()
+            val queue = PriorityInMemoryQueue.create<Int>(backgroundScope) {
+                attemptTimeout = 100.milliseconds
+                process { event ->
+                    if (event == 1) awaitCancellation()
+                    processed.add(event)
+                }
+                onDeadLetter = { _, cause -> deadLetterCauses.add(cause) }
+            }
+
+            queue.enqueue(1, Priority.HIGH)
+            queue.enqueue(2, Priority.HIGH)
+            queue.stop()
+
+            processed shouldContainExactly listOf(2)
+            currentTime shouldBe 100
+            deadLetterCauses.single().shouldBeInstanceOf<AttemptTimeoutException>()
+            queue.metrics(Priority.HIGH).processed shouldBe 1
+            queue.metrics(Priority.HIGH).deadLettered shouldBe 1
         }
     }
 

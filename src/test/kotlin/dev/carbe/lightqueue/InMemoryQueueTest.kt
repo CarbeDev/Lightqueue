@@ -157,6 +157,7 @@ class InMemoryQueueTest : FunSpec({
             val ownerJob = Job()
             val ownerScope = CoroutineScope(backgroundScope.coroutineContext + ownerJob)
             val queue = InMemoryQueue.create<Int>(ownerScope) {
+                attemptTimeout = 1_000.milliseconds
                 process { awaitCancellation() }
                 onDropped = { droppedEvents.add(it) }
             }
@@ -172,8 +173,10 @@ class InMemoryQueueTest : FunSpec({
             val metrics = queue.metrics()
             metrics.enqueued shouldBe 1
             metrics.dropped shouldBe 1
+            metrics.deadLettered shouldBe 0
             metrics.depth shouldBe 0
             metrics.inFlight shouldBe 0
+            currentTime shouldBe 0
         }
     }
 
@@ -446,6 +449,58 @@ class InMemoryQueueTest : FunSpec({
         }
     }
 
+    test("attempt timeout retries each attempt then dead-letters with its timeout cause") {
+        runTest {
+            var invocations = 0
+            val deadLetterCauses = mutableListOf<Throwable>()
+            val queue = InMemoryQueue.create<Int>(backgroundScope) {
+                attemptTimeout = 100.milliseconds
+                process {
+                    invocations++
+                    awaitCancellation()
+                }
+                retryPolicy {
+                    maxAttempts = 2
+                    backoff = Backoff.noBackoff()
+                }
+                onDeadLetter = { _, cause -> deadLetterCauses.add(cause) }
+            }
+
+            queue.enqueue(42)
+            queue.stop()
+
+            invocations shouldBe 2
+            currentTime shouldBe 200
+            deadLetterCauses shouldHaveSize 1
+            val cause = deadLetterCauses.single().shouldBeInstanceOf<AttemptTimeoutException>()
+            cause.timeout shouldBe 100.milliseconds
+            queue.metrics().processed shouldBe 0
+            queue.metrics().deadLettered shouldBe 1
+            queue.metrics().retries shouldBe 1
+        }
+    }
+
+    test("handler completing before attempt timeout is processed normally") {
+        runTest {
+            val processed = mutableListOf<Int>()
+            val queue = InMemoryQueue.create<Int>(backgroundScope) {
+                attemptTimeout = 100.milliseconds
+                process { event ->
+                    delay(99)
+                    processed.add(event)
+                }
+            }
+
+            queue.enqueue(1)
+            queue.stop()
+
+            processed shouldContainExactly listOf(1)
+            currentTime shouldBe 99
+            queue.metrics().processed shouldBe 1
+            queue.metrics().deadLettered shouldBe 0
+        }
+    }
+
     test("onDeadLetter receives the cause of the last failed attempt") {
         runTest {
             val deadLetterCauses = mutableListOf<Throwable>()
@@ -538,6 +593,19 @@ class InMemoryQueueTest : FunSpec({
                     retryPolicy {
                         maxAttempts = 2
                         backoff = Backoff.noBackoff()
+                    }
+                }
+            }
+        }
+    }
+
+    test("attemptTimeout must be finite and positive") {
+        runTest {
+            listOf(Duration.ZERO, (-1).milliseconds, Duration.INFINITE).forEach { timeout ->
+                shouldThrow<IllegalArgumentException> {
+                    InMemoryQueue.create<Int>(backgroundScope) {
+                        attemptTimeout = timeout
+                        process {}
                     }
                 }
             }
